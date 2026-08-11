@@ -1,0 +1,6101 @@
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
+
+const PORT = Number(process.env.PORT || 4000);
+const HOST = process.env.HOST || '0.0.0.0';
+
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+
+// Admin database operations MUST use a privileged Supabase key.
+// Prefer the newer secret key when available, otherwise use the legacy
+// service-role key. Never put either key in the admin-panel frontend.
+const SUPABASE_ADMIN_KEY =
+  process.env.SUPABASE_SECRET_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  '';
+
+if (!SUPABASE_URL || !SUPABASE_ADMIN_KEY) {
+  throw new Error(
+    'SUPABASE_URL and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) are required.'
+  );
+}
+
+function validatePrivilegedSupabaseKey(key) {
+  // New Supabase secret keys are intentionally opaque and begin with sb_secret_.
+  if (key.startsWith('sb_secret_')) return;
+
+  // Legacy service-role keys are JWTs whose payload role is service_role.
+  // Reject anon/publishable JWTs early; those keys are subject to RLS.
+  if (key.startsWith('sb_publishable_')) {
+    throw new Error(
+      'SUPABASE_ADMIN_KEY is a publishable key. Use the Supabase Secret key (sb_secret_...) or legacy service_role key instead.'
+    );
+  }
+
+  const parts = key.split('.');
+  if (parts.length === 3) {
+    try {
+      const payload = JSON.parse(
+        Buffer.from(parts[1], 'base64url').toString('utf8')
+      );
+      if (payload.role !== 'service_role') {
+        throw new Error(
+          'SUPABASE_ADMIN_KEY is not a service_role JWT. Replace it with the Supabase service_role key.'
+        );
+      }
+      return;
+    } catch (e) {
+      if (e?.message?.includes('service_role JWT')) throw e;
+      throw new Error(
+        'SUPABASE_ADMIN_KEY is not a valid Supabase Secret/service_role key.'
+      );
+    }
+  }
+
+  throw new Error(
+    'SUPABASE_ADMIN_KEY is not a recognized privileged Supabase key. Use sb_secret_... or the legacy service_role key.'
+  );
+}
+
+validatePrivilegedSupabaseKey(SUPABASE_ADMIN_KEY);
+
+/*
+|--------------------------------------------------------------------------
+| Supabase Admin Client
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| SERVICE_ROLE_KEY must NEVER be put inside Flutter/mobile app.
+| This key belongs only on the Express backend.
+|
+*/
+
+const supabaseAdmin = createClient(
+  SUPABASE_URL,
+  SUPABASE_ADMIN_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| Express
+|--------------------------------------------------------------------------
+*/
+
+app.disable('x-powered-by');
+
+app.use(helmet());
+
+app.use(
+  cors({
+    origin:
+      process.env.CORS_ORIGIN === '*' || !process.env.CORS_ORIGIN
+        ? true
+        : process.env.CORS_ORIGIN
+            .split(',')
+            .map((x) => x.trim()),
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('dev'));
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+const now = () => new Date().toISOString();
+
+const id = (prefix) =>
+  `${prefix}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+
+function response(res, data, status = 200) {
+  return res.status(status).json({
+    success: true,
+    data,
+  });
+}
+
+function error(res, status, message, code) {
+  return res.status(status).json({
+    success: false,
+    message,
+    ...(code ? { code } : {}),
+  });
+}
+
+function number(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function bool(value) {
+  return value === true;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Authentication - User
+|--------------------------------------------------------------------------
+*/
+
+async function auth(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+
+    if (!header.startsWith('Bearer ')) {
+      return error(
+        res,
+        401,
+        'Authorization required.',
+        'auth_required'
+      );
+    }
+
+    const token = header.slice(7).trim();
+
+    if (!token) {
+      return error(
+        res,
+        401,
+        'Invalid or expired token.',
+        'auth_invalid'
+      );
+    }
+
+    const {
+      data,
+      error: authError,
+    } = await supabaseAdmin.auth.getUser(token);
+
+    if (authError || !data?.user) {
+      return error(
+        res,
+        401,
+        'Invalid or expired token.',
+        'auth_invalid'
+      );
+    }
+
+    req.user = {
+      id: data.user.id,
+      email: data.user.email || null,
+      name: data.user.user_metadata?.name || null,
+    };
+
+    return next();
+  } catch (e) {
+    console.error('Auth error:', e);
+
+    return error(
+      res,
+      401,
+      'Invalid or expired token.',
+      'auth_invalid'
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Authentication - Admin
+|--------------------------------------------------------------------------
+*/
+
+async function adminAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+
+    if (!header.startsWith('Bearer ')) {
+      return error(
+        res,
+        401,
+        'Authorization required.',
+        'auth_required'
+      );
+    }
+
+    const token = header.slice(7).trim();
+
+    if (!token) {
+      return error(
+        res,
+        401,
+        'Invalid or expired token.',
+        'auth_invalid'
+      );
+    }
+
+    const { data, error: authError } =
+      await supabaseAdmin.auth.getUser(token);
+
+    if (authError || !data?.user) {
+      return error(
+        res,
+        401,
+        'Invalid or expired token.',
+        'auth_invalid'
+      );
+    }
+
+    req.user = {
+      id: data.user.id,
+      email: data.user.email || null,
+      name: data.user.user_metadata?.name || null,
+    };
+
+    const adminEmails = String(process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean);
+
+    if (!adminEmails.length) {
+      console.error('ADMIN_EMAILS is not configured.');
+      return error(
+        res,
+        503,
+        'Admin access is not configured on the server.',
+        'admin_not_configured'
+      );
+    }
+
+    const userEmail = String(req.user.email || '').toLowerCase();
+
+    if (!adminEmails.includes(userEmail)) {
+      return error(
+        res,
+        403,
+        'Admin access required.',
+        'admin_forbidden'
+      );
+    }
+
+    return next();
+  } catch (e) {
+    console.error('Admin auth error:', e);
+
+    return error(
+      res,
+      401,
+      'Invalid admin authentication.',
+      'admin_auth_invalid'
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Profile
+|--------------------------------------------------------------------------
+*/
+
+async function getProfile(userId) {
+  const { data, error: dbError } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (dbError) throw dbError;
+
+  return data;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Question Mapping
+|--------------------------------------------------------------------------
+*/
+
+function mapQuestion(row, options = {}) {
+  const {
+    includeAnswer = false,
+    userState = {},
+    answerState = null,
+  } = options;
+
+  const question = {
+    id: row.id,
+
+    questionId: row.question_id,
+    stem: row.stem,
+    questionType: row.question_type,
+    difficulty: row.difficulty,
+    sourceYear: row.source_year,
+    examName: row.exam_name,
+
+    examId: row.exam_id,
+    subjectId: row.subject_id,
+    topicId: row.topic_id,
+
+    options: row.options || {},
+    explanation: row.explanation || null,
+
+    imageUrl: row.image_url || null,
+    hasImage: Boolean(row.has_image),
+
+    isBookmarked: Boolean(userState.isBookmarked),
+    markedForReview: Boolean(userState.markedForReview),
+    inRevisionQueue: Boolean(userState.inRevisionQueue),
+
+    sources: userState.sources || [],
+  };
+
+  // Never expose the correct answer while the session is active.
+  if (includeAnswer) {
+    question.correctOption = row.correct_option;
+
+    // The app uses the persisted session_answers as the source of truth
+    // after submission. Keep the scoring metadata together with the result.
+    question.correctMarks = 4;
+    question.negativeMarks = 1;
+    question.skipMarks = 0;
+
+    if (answerState) {
+      question.isCorrect =
+        answerState.is_correct === null ||
+        answerState.is_correct === undefined
+          ? null
+          : Boolean(answerState.is_correct);
+      question.marksAwarded = Number(answerState.marks || 0);
+      question.answeredAt = answerState.answered_at || null;
+    } else {
+      question.isCorrect = null;
+      question.marksAwarded = 0;
+      question.answeredAt = null;
+    }
+  }
+
+  return question;
+}
+
+/*
+|--------------------------------------------------------------------------
+| User Question State
+|--------------------------------------------------------------------------
+*/
+
+async function getUserQuestionStates(userId, questionIds = []) {
+  if (!questionIds.length) {
+    return {};
+  }
+
+  const result = {};
+
+  questionIds.forEach((id) => {
+    result[id] = {
+      isBookmarked: false,
+      markedForReview: false,
+      inRevisionQueue: false,
+      sources: [],
+    };
+  });
+
+  const { data: bookmarks, error: bookmarkError } =
+    await supabaseAdmin
+      .from('bookmarks')
+      .select('question_id')
+      .eq('user_id', userId)
+      .in('question_id', questionIds);
+
+  if (bookmarkError) throw bookmarkError;
+
+  for (const row of bookmarks || []) {
+    if (result[row.question_id]) {
+      result[row.question_id].isBookmarked = true;
+      result[row.question_id].sources.push('bookmarks');
+    }
+  }
+
+  const { data: marks, error: marksError } =
+    await supabaseAdmin
+      .from('revision_marks')
+      .select('question_id, marked')
+      .eq('user_id', userId)
+      .eq('marked', true)
+      .in('question_id', questionIds);
+
+  if (marksError) throw marksError;
+
+  for (const row of marks || []) {
+    if (result[row.question_id]) {
+      result[row.question_id].markedForReview = true;
+      result[row.question_id].inRevisionQueue = true;
+      result[row.question_id].sources.push('manual');
+    }
+  }
+
+  const { data: revisionQuestions, error: revisionError } =
+    await supabaseAdmin
+      .from('revision_questions')
+      .select('question_id, source')
+      .eq('user_id', userId)
+      .in('question_id', questionIds);
+
+  if (revisionError) throw revisionError;
+
+  for (const row of revisionQuestions || []) {
+    if (!result[row.question_id]) continue;
+
+    result[row.question_id].inRevisionQueue = true;
+
+    if (row.source && !result[row.question_id].sources.includes(row.source)) {
+      result[row.question_id].sources.push(row.source);
+    }
+  }
+
+  const { data: wrongQuestions, error: wrongError } =
+    await supabaseAdmin
+      .from('wrong_questions')
+      .select('question_id')
+      .eq('user_id', userId)
+      .in('question_id', questionIds);
+
+  if (wrongError) throw wrongError;
+
+  for (const row of wrongQuestions || []) {
+    if (result[row.question_id]) {
+      result[row.question_id].sources.push('wrong');
+    }
+  }
+
+  const { data: weakTopics, error: weakError } =
+    await supabaseAdmin
+      .from('weak_topics')
+      .select('question_id')
+      .eq('user_id', userId)
+      .in('question_id', questionIds);
+
+  if (weakError) throw weakError;
+
+  for (const row of weakTopics || []) {
+    if (row.question_id && result[row.question_id]) {
+      result[row.question_id].sources.push('weak_topics');
+    }
+  }
+
+  for (const key of Object.keys(result)) {
+    result[key].sources = [
+      ...new Set(result[key].sources),
+    ];
+  }
+
+  return result;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Revision Summary
+|--------------------------------------------------------------------------
+*/
+
+async function revisionSummary(userId) {
+  const [
+    wrongResult,
+    bookmarkResult,
+    weakResult,
+    manualResult,
+  ] = await Promise.all([
+    supabaseAdmin
+      .from('wrong_questions')
+      .select('question_id')
+      .eq('user_id', userId),
+
+    supabaseAdmin
+      .from('bookmarks')
+      .select('question_id')
+      .eq('user_id', userId),
+
+    supabaseAdmin
+      .from('weak_topics')
+      .select('question_id, topic_id'),
+
+    supabaseAdmin
+      .from('revision_marks')
+      .select('question_id')
+      .eq('user_id', userId)
+      .eq('marked', true),
+  ]);
+
+  if (wrongResult.error) throw wrongResult.error;
+  if (bookmarkResult.error) throw bookmarkResult.error;
+  if (weakResult.error) throw weakResult.error;
+  if (manualResult.error) throw manualResult.error;
+
+  const wrong = new Set(
+    (wrongResult.data || []).map((x) => x.question_id)
+  );
+
+  const bookmarks = new Set(
+    (bookmarkResult.data || []).map((x) => x.question_id)
+  );
+
+  const weak = new Set(
+    (weakResult.data || [])
+      .filter((x) => x.question_id)
+      .map((x) => x.question_id)
+  );
+
+  const manual = new Set(
+    (manualResult.data || []).map((x) => x.question_id)
+  );
+
+  const total = new Set([
+    ...wrong,
+    ...bookmarks,
+    ...weak,
+    ...manual,
+  ]);
+
+  return {
+    wrongQuestions: wrong.size,
+    bookmarks: bookmarks.size,
+    weakTopics: weak.size,
+    manualRevisionMarks: manual.size,
+    total: total.size,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Revision Queue
+|--------------------------------------------------------------------------
+*/
+
+async function queueFor(userId, sources) {
+  const wanted = new Set();
+
+  const normalized = Array.isArray(sources) && sources.length
+    ? sources
+    : ['wrong'];
+
+  if (
+    normalized.includes('wrong') ||
+    normalized.includes('mixed')
+  ) {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('wrong_questions')
+      .select('question_id')
+      .eq('user_id', userId);
+
+    if (dbError) throw dbError;
+
+    for (const row of data || []) {
+      wanted.add(row.question_id);
+    }
+  }
+
+  if (
+    normalized.includes('bookmarks') ||
+    normalized.includes('mixed')
+  ) {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('bookmarks')
+      .select('question_id')
+      .eq('user_id', userId);
+
+    if (dbError) throw dbError;
+
+    for (const row of data || []) {
+      wanted.add(row.question_id);
+    }
+  }
+
+  if (
+    normalized.includes('weak_topics') ||
+    normalized.includes('mixed')
+  ) {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('weak_topics')
+      .select('question_id')
+      .eq('user_id', userId)
+      .not('question_id', 'is', null);
+
+    if (dbError) throw dbError;
+
+    for (const row of data || []) {
+      if (row.question_id) wanted.add(row.question_id);
+    }
+  }
+
+  if (
+    normalized.includes('manual') ||
+    normalized.includes('mixed')
+  ) {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('revision_marks')
+      .select('question_id')
+      .eq('user_id', userId)
+      .eq('marked', true);
+
+    if (dbError) throw dbError;
+
+    for (const row of data || []) {
+      wanted.add(row.question_id);
+    }
+  }
+
+  if (!wanted.size) {
+    return [];
+  }
+
+  const ids = [...wanted];
+
+  const { data: questions, error: questionError } =
+    await supabaseAdmin
+      .from('questions')
+      .select('*')
+      .in('id', ids);
+
+  if (questionError) throw questionError;
+
+  const states = await getUserQuestionStates(userId, ids);
+
+  return (questions || []).map((question) =>
+    mapQuestion(question, {
+      includeAnswer: false,
+      userState: states[question.id],
+    })
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Session Mapping
+|--------------------------------------------------------------------------
+*/
+
+async function loadSession(sessionId, userId) {
+  const { data: session, error: sessionError } =
+    await supabaseAdmin
+      .from('sessions')
+      .select('*')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+  if (sessionError) throw sessionError;
+
+  if (!session) {
+    return null;
+  }
+
+  const { data: sessionQuestions, error: questionsError } =
+    await supabaseAdmin
+      .from('session_questions')
+      .select(`
+        *,
+        question:questions(*)
+      `)
+      .eq('session_id', sessionId)
+      .order('position', { ascending: true });
+
+  if (questionsError) throw questionsError;
+
+  const questionIds = (sessionQuestions || []).map(
+    (x) => x.question_id
+  );
+
+  const states = await getUserQuestionStates(
+    userId,
+    questionIds
+  );
+
+  const includeAnswer =
+    session.status === 'COMPLETED' ||
+    session.is_submitted === true;
+
+  // Answers are stored separately from session_questions. Joining them here
+  // is what makes result/review pages show the real correctness and marks.
+  const answerMap = {};
+  if (includeAnswer && questionIds.length) {
+    const { data: answers, error: answersError } =
+      await supabaseAdmin
+        .from('session_answers')
+        .select('question_id,answer,is_correct,marks,answered_at')
+        .eq('session_id', sessionId)
+        .in('question_id', questionIds);
+
+    if (answersError) throw answersError;
+
+    for (const answer of answers || []) {
+      answerMap[answer.question_id] = answer;
+    }
+  }
+
+  const questions = (sessionQuestions || []).map((row) => ({
+    ...mapQuestion(row.question, {
+      includeAnswer,
+      userState: states[row.question_id],
+      answerState: answerMap[row.question_id] || null,
+    }),
+
+    id: row.question.id,
+    position: row.position,
+
+    userAnswer:
+      row.user_answer !== null && row.user_answer !== undefined
+        ? row.user_answer
+        : answerMap[row.question_id]?.answer ?? null,
+    markedForReview: Boolean(row.marked_for_review),
+    isBookmarked: Boolean(row.is_bookmarked),
+    inRevisionQueue: Boolean(row.in_revision_queue),
+
+    timeSpent: row.time_spent || 0,
+  }));
+
+  return {
+    id: session.id,
+    mode: session.mode,
+    setId: session.set_id,
+    setName: session.set_name,
+    sessionType: session.session_type,
+
+    status: session.status,
+
+    startedAt: session.started_at,
+    submittedAt: session.submitted_at,
+    lastActivityAt: session.last_activity_at,
+
+    durationSeconds: session.duration_seconds,
+    timeSpent: session.time_spent,
+
+    totalQuestions: session.total_questions,
+    answeredQuestions: session.answered_questions,
+
+    isSubmitted: session.is_submitted,
+
+    result:
+      session.score !== null
+        ? {
+            score: session.score,
+            percentage: Number(session.percentage || 0),
+            totalQuestions: session.total_questions,
+            totalCorrect: session.total_correct || 0,
+            totalWrong: session.total_wrong || 0,
+            totalUnanswered: session.total_unanswered || 0,
+          }
+        : null,
+
+    questions,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| History
+|--------------------------------------------------------------------------
+*/
+
+function historyFromSession(s) {
+  return {
+    id: s.id,
+    setId: s.set_id,
+    setName: s.set_name,
+    sessionType: s.session_type,
+    mode: s.mode,
+    status: s.status,
+
+    startedAt: s.started_at,
+    submittedAt: s.submitted_at || null,
+    lastActivityAt:
+      s.last_activity_at ||
+      s.submitted_at ||
+      s.started_at,
+
+    durationSeconds: s.duration_seconds,
+    timeSpent: s.time_spent || 0,
+
+    totalQuestions: s.total_questions,
+    answeredQuestions: s.answered_questions,
+
+    score: s.score ?? null,
+    percentage:
+      s.percentage !== null
+        ? Number(s.percentage)
+        : null,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Create Session
+|--------------------------------------------------------------------------
+*/
+
+async function makeSession(
+  userId,
+  questionIds,
+  mode = 'practice',
+  sessionType = 'set_based',
+  body = {}
+) {
+  const uniqueQuestionIds = [
+    ...new Set(questionIds),
+  ];
+
+  if (!uniqueQuestionIds.length) {
+    throw new Error('No questions available.');
+  }
+
+  const { data: questions, error: questionError } =
+    await supabaseAdmin
+      .from('questions')
+      .select('*')
+      .in('id', uniqueQuestionIds);
+
+  if (questionError) throw questionError;
+
+  if (!questions?.length) {
+    throw new Error('No valid questions found.');
+  }
+
+  const questionMap = new Map(
+    questions.map((q) => [q.id, q])
+  );
+
+  const orderedQuestions = uniqueQuestionIds
+    .map((qid) => questionMap.get(qid))
+    .filter(Boolean);
+
+  const setId = body.setId || null;
+
+  let setName = null;
+
+  if (setId) {
+    const { data: set, error: setError } =
+      await supabaseAdmin
+        .from('sets')
+        .select('id, name')
+        .eq('id', setId)
+        .maybeSingle();
+
+    if (setError) throw setError;
+
+    setName = set?.name || null;
+  }
+
+  if (!setName) {
+    setName =
+      mode === 'review'
+        ? 'Revision queue'
+        : 'Practice session';
+  }
+
+  const durationSeconds = Math.max(
+    0,
+    number(body.durationSeconds, 1800)
+  );
+
+  const { data: session, error: sessionError } =
+    await supabaseAdmin
+      .from('sessions')
+      .insert({
+        user_id: userId,
+
+        mode,
+        set_id: setId,
+        set_name: setName,
+
+        session_type: sessionType,
+        status: 'IN_PROGRESS',
+
+        started_at: now(),
+        last_activity_at: now(),
+
+        duration_seconds: durationSeconds,
+
+        total_questions: orderedQuestions.length,
+        answered_questions: 0,
+
+        is_submitted: false,
+      })
+      .select('*')
+      .single();
+
+  if (sessionError) throw sessionError;
+
+  const sessionRows = orderedQuestions.map(
+    (question, index) => ({
+      session_id: session.id,
+      question_id: question.id,
+      position: index + 1,
+      user_answer: null,
+      marked_for_review: false,
+      is_bookmarked: false,
+      in_revision_queue: false,
+      time_spent: 0,
+    })
+  );
+
+  const { error: insertQuestionsError } =
+    await supabaseAdmin
+      .from('session_questions')
+      .insert(sessionRows);
+
+  if (insertQuestionsError) {
+    await supabaseAdmin
+      .from('sessions')
+      .delete()
+      .eq('id', session.id);
+
+    throw insertQuestionsError;
+  }
+
+  return loadSession(session.id, userId);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Answer
+|--------------------------------------------------------------------------
+*/
+
+async function applyAnswer(
+  sessionId,
+  userId,
+  body
+) {
+  if (!body?.questionId) {
+    throw new Error('questionId is required.');
+  }
+
+  // Accept both the public question_id (e.g. question-1) and the
+  // internal UUID. Older mobile builds may send either form.
+  let { data: question, error: questionLookupError } =
+    await supabaseAdmin
+      .from('questions')
+      .select('id, question_id')
+      .eq('question_id', String(body.questionId))
+      .maybeSingle();
+
+  if (questionLookupError) throw questionLookupError;
+
+  if (!question) {
+    const uuidCandidate = String(body.questionId);
+    const looksLikeUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        uuidCandidate
+      );
+
+    if (looksLikeUuid) {
+      const fallback = await supabaseAdmin
+        .from('questions')
+        .select('id, question_id')
+        .eq('id', uuidCandidate)
+        .maybeSingle();
+
+      if (fallback.error) throw fallback.error;
+      question = fallback.data;
+    }
+  }
+
+  if (!question) {
+    throw new Error('Unknown questionId.');
+  }
+
+  const { data: sessionQuestion, error: sessionQuestionError } =
+    await supabaseAdmin
+      .from('session_questions')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('question_id', question.id)
+      .maybeSingle();
+
+  if (sessionQuestionError) throw sessionQuestionError;
+
+  if (!sessionQuestion) {
+    throw new Error(
+      'Question does not belong to this session.'
+    );
+  }
+
+  const update = {};
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      body,
+      'answer'
+    )
+  ) {
+    update.user_answer = body.answer;
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      body,
+      'markedForReview'
+    )
+  ) {
+    update.marked_for_review =
+      body.markedForReview === true;
+
+    const { error } = await supabaseAdmin
+      .from('revision_marks')
+      .upsert(
+        {
+          user_id: userId,
+          question_id: question.id,
+          marked: body.markedForReview === true,
+          updated_at: now(),
+        },
+        {
+          onConflict: 'user_id,question_id',
+        }
+      );
+
+    if (error) throw error;
+
+    if (body.markedForReview === true) {
+      await supabaseAdmin
+        .from('revision_questions')
+        .upsert(
+          {
+            user_id: userId,
+            question_id: question.id,
+            source: 'manual',
+          },
+          {
+            onConflict:
+              'user_id,question_id,source',
+          }
+        );
+    }
+  }
+
+  const bookmarkValue =
+    Object.prototype.hasOwnProperty.call(
+      body,
+      'bookmarked'
+    )
+      ? body.bookmarked
+      : body.bookmark;
+
+  if (bookmarkValue !== undefined) {
+    update.is_bookmarked =
+      bookmarkValue === true;
+
+    if (bookmarkValue === true) {
+      const { error } = await supabaseAdmin
+        .from('bookmarks')
+        .upsert(
+          {
+            user_id: userId,
+            question_id: question.id,
+          },
+          {
+            onConflict: 'user_id,question_id',
+          }
+        );
+
+      if (error) throw error;
+    } else {
+      const { error } = await supabaseAdmin
+        .from('bookmarks')
+        .delete()
+        .eq('user_id', userId)
+        .eq('question_id', question.id);
+
+      if (error) throw error;
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      body,
+      'inRevisionQueue'
+    )
+  ) {
+    update.in_revision_queue =
+      body.inRevisionQueue === true;
+  }
+
+  if (typeof body.timeSpent === 'number') {
+    update.time_spent = Math.max(
+      0,
+      Math.floor(body.timeSpent)
+    );
+  }
+
+  if (Object.keys(update).length > 0) {
+    const { error: updateError } =
+      await supabaseAdmin
+        .from('session_questions')
+        .update(update)
+        .eq('id', sessionQuestion.id);
+
+    if (updateError) throw updateError;
+  }
+
+  /*
+   * Keep session answer table synchronized.
+   */
+  if (
+    Object.prototype.hasOwnProperty.call(
+      body,
+      'answer'
+    )
+  ) {
+    const { data: questionFull, error: qError } =
+      await supabaseAdmin
+        .from('questions')
+        .select('correct_option')
+        .eq('id', question.id)
+        .single();
+
+    if (qError) throw qError;
+
+    const answer = body.answer;
+    const isCorrect =
+      answer != null &&
+      answer === questionFull.correct_option;
+
+    const marks = answer == null
+      ? 0
+      : isCorrect
+        ? 4
+        : -1;
+
+    const { error: answerError } =
+      await supabaseAdmin
+        .from('session_answers')
+        .upsert(
+          {
+            session_id: sessionId,
+            question_id: question.id,
+            answer: answer,
+            is_correct:
+              answer == null ? null : isCorrect,
+            marks,
+            answered_at: now(),
+          },
+          {
+            onConflict:
+              'session_id,question_id',
+          }
+        );
+
+    if (answerError) throw answerError;
+  }
+
+  const { count: answeredCount, error: countError } =
+    await supabaseAdmin
+      .from('session_questions')
+      .select('*', {
+        count: 'exact',
+        head: true,
+      })
+      .eq('session_id', sessionId)
+      .not('user_answer', 'is', null);
+
+  if (countError) throw countError;
+
+  const { error: sessionUpdateError } =
+    await supabaseAdmin
+      .from('sessions')
+      .update({
+        answered_questions: answeredCount || 0,
+        last_activity_at: now(),
+      })
+      .eq('id', sessionId)
+      .eq('user_id', userId);
+
+  if (sessionUpdateError) throw sessionUpdateError;
+
+  return loadSession(sessionId, userId);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Submit Session
+|--------------------------------------------------------------------------
+*/
+
+async function submitSession(sessionId, userId) {
+  const { data: session, error: sessionError } =
+    await supabaseAdmin
+      .from('sessions')
+      .select('*')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .single();
+
+  if (sessionError) throw sessionError;
+
+  if (session.is_submitted) {
+    return loadSession(sessionId, userId);
+  }
+
+  const { data: rows, error: rowsError } =
+    await supabaseAdmin
+      .from('session_questions')
+      .select(`
+        *,
+        question:questions(
+          id,
+          question_id,
+          correct_option
+        )
+      `)
+      .eq('session_id', sessionId)
+      .order('position', {
+        ascending: true,
+      });
+
+  if (rowsError) throw rowsError;
+
+  let correct = 0;
+  let wrong = 0;
+  let unanswered = 0;
+  let timeSpent = 0;
+
+  for (const row of rows || []) {
+    timeSpent += Number(row.time_spent || 0);
+
+    if (row.user_answer == null) {
+      unanswered++;
+      continue;
+    }
+
+    const isCorrect =
+      row.user_answer ===
+      row.question.correct_option;
+
+    if (isCorrect) {
+      correct++;
+    } else {
+      wrong++;
+
+      /*
+       * Upsert wrong question.
+       */
+      const { data: existingWrong } =
+        await supabaseAdmin
+          .from('wrong_questions')
+          .select(
+            'id, attempt_count'
+          )
+          .eq('user_id', userId)
+          .eq(
+            'question_id',
+            row.question_id
+          )
+          .maybeSingle();
+
+      if (existingWrong) {
+        await supabaseAdmin
+          .from('wrong_questions')
+          .update({
+            attempt_count:
+              Number(existingWrong.attempt_count || 0) + 1,
+            last_wrong_at: now(),
+          })
+          .eq('id', existingWrong.id);
+      } else {
+        await supabaseAdmin
+          .from('wrong_questions')
+          .insert({
+            user_id: userId,
+            question_id: row.question_id,
+            attempt_count: 1,
+            last_wrong_at: now(),
+          });
+      }
+    }
+  }
+
+  const total = rows?.length || 0;
+
+  const score =
+    correct * 4 - wrong;
+
+  const percentage =
+    total > 0
+      ? Math.round(
+          (correct / total) * 100
+        )
+      : 0;
+
+  /*
+   * Update session.
+   */
+  const { error: updateError } =
+    await supabaseAdmin
+      .from('sessions')
+      .update({
+        status: 'COMPLETED',
+        is_submitted: true,
+
+        submitted_at: now(),
+        last_activity_at: now(),
+
+        answered_questions:
+          correct + wrong,
+
+        time_spent: timeSpent,
+
+        score,
+        percentage,
+
+        total_correct: correct,
+        total_wrong: wrong,
+        total_unanswered: unanswered,
+      })
+      .eq('id', sessionId)
+      .eq('user_id', userId);
+
+  if (updateError) throw updateError;
+
+  /*
+   * Save final answers / marks.
+   */
+  for (const row of rows || []) {
+    if (row.user_answer == null) continue;
+
+    const isCorrect =
+      row.user_answer ===
+      row.question.correct_option;
+
+    const { error: answerError } = await supabaseAdmin
+      .from('session_answers')
+      .upsert(
+        {
+          session_id: sessionId,
+          question_id: row.question_id,
+          answer: row.user_answer,
+          is_correct: isCorrect,
+          marks: isCorrect ? 4 : -1,
+          answered_at: now(),
+        },
+        {
+          onConflict:
+            'session_id,question_id',
+        }
+      );
+
+    if (answerError) throw answerError;
+  }
+
+  return loadSession(sessionId, userId);
+}
+
+/*
+|--------------------------------------------------------------------------
+| HEALTH
+|--------------------------------------------------------------------------
+*/
+
+app.get('/health', (req, res) =>
+  res.json({
+    status: 'ok',
+    service: 'pyq-pulse-express',
+    time: now(),
+    authProvider: 'supabase',
+    storageProvider: 'supabase',
+  })
+);
+
+/*
+|--------------------------------------------------------------------------
+| AUTH
+|--------------------------------------------------------------------------
+*/
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+    } = req.body || {};
+
+    if (!email || !password) {
+      return error(
+        res,
+        400,
+        'Email and password are required.',
+        'auth_missing_fields'
+      );
+    }
+
+    const {
+      data,
+      error: authError,
+    } = await supabaseAdmin.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (
+      authError ||
+      !data?.session ||
+      !data?.user
+    ) {
+      return error(
+        res,
+        401,
+        authError?.message || 'Login failed.',
+        'auth_failed'
+      );
+    }
+
+    const profile =
+      await getProfile(data.user.id);
+
+    return response(res, {
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        name:
+          profile?.name ||
+          data.user.user_metadata?.name ||
+          null,
+        avatarUrl:
+          profile?.avatar_url || null,
+      },
+
+      accessToken:
+        data.session.access_token,
+
+      refreshToken:
+        data.session.refresh_token,
+    });
+  } catch (e) {
+    console.error(e);
+
+    return error(
+      res,
+      500,
+      e.message,
+      'auth_login_error'
+    );
+  }
+});
+
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+      name,
+    } = req.body || {};
+
+    if (!email || !password) {
+      return error(
+        res,
+        400,
+        'Email and password are required.',
+        'auth_missing_fields'
+      );
+    }
+
+    const {
+      data,
+      error: authError,
+    } = await supabaseAdmin.auth.signUp({
+      email,
+      password,
+
+      options: {
+        data: {
+          name: name || null,
+        },
+      },
+    });
+
+    if (authError) {
+      return error(
+        res,
+        400,
+        authError.message,
+        'auth_signup_failed'
+      );
+    }
+
+    return response(res, {
+      user: data.user
+        ? {
+            id: data.user.id,
+            email: data.user.email,
+            name:
+              data.user.user_metadata?.name ||
+              null,
+          }
+        : null,
+
+      accessToken:
+        data.session?.access_token || null,
+
+      refreshToken:
+        data.session?.refresh_token || null,
+
+      requiresEmailConfirmation:
+        Boolean(
+          data.user &&
+          !data.session
+        ),
+    });
+  } catch (e) {
+    console.error(e);
+
+    return error(
+      res,
+      500,
+      e.message,
+      'auth_signup_error'
+    );
+  }
+});
+
+app.post(
+  '/auth/logout',
+  auth,
+  async (req, res) => {
+    /*
+     * Supabase JWT remains valid until expiry.
+     * Flutter should remove its local session/token.
+     */
+    return response(res, {
+      success: true,
+    });
+  }
+);
+
+app.get(
+  '/auth/me',
+  auth,
+  async (req, res) => {
+    try {
+      const profile =
+        await getProfile(req.user.id);
+
+      return response(res, {
+        user: {
+          id: req.user.id,
+          email:
+            profile?.email ||
+            req.user.email,
+          name:
+            profile?.name ||
+            req.user.name ||
+            null,
+          avatarUrl:
+            profile?.avatar_url ||
+            null,
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'profile_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| APP CONFIG
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/app-config',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('app_config')
+          .select('key,value');
+
+      if (dbError) throw dbError;
+
+      const config = {};
+
+      for (const row of data || []) {
+        config[row.key] = row.value;
+      }
+
+      return response(res, {
+        config: {
+          feature_flags: {
+            market_enabled: true,
+            mock_enabled: true,
+            review_enabled: true,
+            maintenance_mode: false,
+            ...(config.feature_flags || {}),
+          },
+          default_limits: {
+            practiceQuestions: 10,
+            quizQuestions: 10,
+            testQuestions: 30,
+            ...(config.default_limits || {}),
+          },
+          ...config,
+          resolvedAt: now(),
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'config_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| BANNERS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/banners',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('banners')
+          .select('*')
+          .eq('is_active', true)
+          .order('sort_order', {
+            ascending: true,
+          });
+
+      if (dbError) throw dbError;
+
+      const banners = (data || []).map(
+        (row) => ({
+          id: row.id,
+          title: row.title,
+          subtitle: row.subtitle,
+          imageUrl: row.image_url,
+          isActive: row.is_active,
+          sortOrder: row.sort_order,
+        })
+      );
+
+      return response(res, {
+        banners,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'banners_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| EXAMS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/exams',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('exams')
+          .select('*')
+          .eq('is_active', true)
+          .order('display_order', {
+            ascending: true,
+          });
+
+      if (dbError) throw dbError;
+
+      const exams = (data || []).map(
+        (row) => ({
+          id: row.id,
+          name: row.name,
+          code: row.code,
+          shortName: row.short_name,
+          description: row.description,
+
+          isActive: row.is_active,
+          isFeatured: row.is_featured,
+          displayOrder: row.display_order,
+
+          totalSets: row.total_sets,
+          totalQuestionsAvailable:
+            row.total_questions_available,
+          freeSets: row.free_sets,
+        })
+      );
+
+      return response(res, {
+        exams,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'exams_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SETS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/sets',
+  async (req, res) => {
+    try {
+      let query = supabaseAdmin
+        .from('sets')
+        .select('*')
+        .eq('is_published', true)
+        .order('created_at', {
+          ascending: false,
+        });
+
+      if (req.query.examId) {
+        query = query.eq(
+          'exam_id',
+          req.query.examId
+        );
+      }
+
+      if (req.query.subjectId) {
+        query = query.eq(
+          'subject_id',
+          req.query.subjectId
+        );
+      }
+
+      if (req.query.setType) {
+        query = query.eq(
+          'set_type',
+          req.query.setType
+        );
+      }
+
+      const { data, error: dbError } =
+        await query;
+
+      if (dbError) throw dbError;
+
+      const sets = (data || []).map(
+        (row) => ({
+          id: row.id,
+          name: row.name,
+
+          examId: row.exam_id,
+          examName: row.exam_name,
+
+          subjectId: row.subject_id,
+
+          setType: row.set_type,
+          year: row.year,
+
+          totalQuestions:
+            row.total_questions,
+
+          isFree: row.is_free,
+          isPublished: row.is_published,
+          accessStatus: row.access_status,
+        })
+      );
+
+      return response(res, {
+        sets,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'sets_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| MARKET PRODUCTS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/market-products',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('market_products')
+          .select('*')
+          .eq('is_active', true)
+          .order('featured', {
+            ascending: false,
+          });
+
+      if (dbError) throw dbError;
+
+      const products = (data || []).map(
+        (row) => ({
+          id: row.id,
+          title: row.title,
+          description: row.description,
+
+          category: row.category,
+          type: row.type,
+
+          price:
+            row.price !== null
+              ? String(row.price)
+              : null,
+
+          salePrice:
+            row.sale_price !== null
+              ? String(row.sale_price)
+              : null,
+
+          mrp:
+            row.mrp !== null
+              ? String(row.mrp)
+              : null,
+
+          currency: row.currency,
+          stock: row.stock,
+
+          isActive: row.is_active,
+          featured: row.featured,
+
+          imageUrl: row.image_url,
+        })
+      );
+
+      return response(res, {
+        products,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'products_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SUBSCRIPTIONS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/subscription-plans',
+  auth,
+  async (req, res) => {
+    try {
+      const { data: plans, error: plansError } =
+        await supabaseAdmin
+          .from('subscription_plans')
+          .select('*')
+          .eq('is_active', true)
+          .order('price', {
+            ascending: true,
+          });
+
+      if (plansError) throw plansError;
+
+      const { data: subscriptions, error: subError } =
+        await supabaseAdmin
+          .from('user_subscriptions')
+          .select(`
+            *,
+            plan:subscription_plans(*)
+          `)
+          .eq('user_id', req.user.id)
+          .eq('status', 'ACTIVE')
+          .order('created_at', {
+            ascending: false,
+          })
+          .limit(1);
+
+      if (subError) throw subError;
+
+      const active =
+        subscriptions?.[0] || null;
+
+      return response(res, {
+        plans: (plans || []).map(
+          (row) => ({
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            durationDays: row.duration_days,
+
+            price: String(row.price),
+            mrp:
+              row.mrp !== null
+                ? String(row.mrp)
+                : null,
+
+            currency: row.currency,
+
+            hasAccess:
+              active?.plan_id === row.id,
+          })
+        ),
+
+        activeSubscription: active
+          ? {
+              id: active.id,
+              planId: active.plan_id,
+              planName:
+                active.plan?.name || null,
+              status: active.status,
+              startedAt: active.started_at,
+              expiresAt: active.expires_at,
+            }
+          : null,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'subscription_error'
+      );
+    }
+  }
+);
+
+app.get(
+  '/api/subscriptions/catalog',
+  auth,
+  async (req, res) => {
+    try {
+      const { data: plans, error: plansError } = await supabaseAdmin
+        .from('subscription_plans')
+        .select('*')
+        .eq('is_active', true)
+        .order('price', { ascending: true });
+
+      if (plansError) throw plansError;
+
+      const { data: subscriptions, error: subError } = await supabaseAdmin
+        .from('user_subscriptions')
+        .select(`
+          *,
+          plan:subscription_plans(*)
+        `)
+        .eq('user_id', req.user.id)
+        .eq('status', 'ACTIVE')
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (subError) throw subError;
+
+      const active = subscriptions?.[0] || null;
+
+      return response(res, {
+        plans: (plans || []).map((row) => ({
+          id: row.id,
+          name: row.name,
+          description: row.description,
+          durationDays: row.duration_days,
+          price: String(row.price),
+          mrp: row.mrp !== null ? String(row.mrp) : null,
+          currency: row.currency,
+          hasAccess: active?.plan_id === row.id,
+        })),
+        activeSubscription: active
+          ? {
+              id: active.id,
+              planId: active.plan_id,
+              planName: active.plan?.name || null,
+              status: active.status,
+              startedAt: active.started_at,
+              expiresAt: active.expires_at,
+            }
+          : null,
+      });
+    } catch (e) {
+      return error(res, 500, e.message, 'subscription_catalog_error');
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| TAXONOMY
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/taxonomy/subjects',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('subjects')
+          .select('*')
+          .order('display_order', {
+            ascending: true,
+          });
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        subjects: (data || []).map(
+          (row) => ({
+            id: row.id,
+            name: row.name,
+            examId: row.exam_id,
+            questionCount:
+              row.question_count,
+            nodeType: row.node_type,
+            slug: row.slug,
+            displayOrder:
+              row.display_order,
+          })
+        ),
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'subjects_error'
+      );
+    }
+  }
+);
+
+app.get(
+  '/api/subjects/shortcuts',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } = await supabaseAdmin
+        .from('subjects')
+        .select('*')
+        .order('display_order', { ascending: true });
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        subjects: (data || []).map((row) => ({
+          id: row.id,
+          name: row.name,
+          examId: row.exam_id,
+          questionCount: row.question_count,
+          nodeType: row.node_type,
+          slug: row.slug,
+          displayOrder: row.display_order,
+        })),
+      });
+    } catch (e) {
+      return error(res, 500, e.message, 'subjects_shortcuts_error');
+    }
+  }
+);
+
+app.get(
+  '/api/taxonomy/tree',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('taxonomy_nodes')
+          .select('*')
+          .order('display_order', {
+            ascending: true,
+          });
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        nodes: (data || []).map(
+          (row) => ({
+            id: row.id,
+            parentId: row.parent_id,
+            subjectId: row.subject_id,
+            examId: row.exam_id,
+
+            name: row.name,
+            nodeType: row.node_type,
+            slug: row.slug,
+            displayOrder:
+              row.display_order,
+          })
+        ),
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'taxonomy_error'
+      );
+    }
+  }
+);
+
+app.get(
+  '/api/subjects/taxonomy',
+  async (req, res) => {
+    try {
+      const { data, error: dbError } = await supabaseAdmin
+        .from('taxonomy_nodes')
+        .select('*')
+        .order('display_order', { ascending: true });
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        nodes: (data || []).map((row) => ({
+          id: row.id,
+          parentId: row.parent_id,
+          subjectId: row.subject_id,
+          examId: row.exam_id,
+          name: row.name,
+          nodeType: row.node_type,
+          slug: row.slug,
+          displayOrder: row.display_order,
+        })),
+      });
+    } catch (e) {
+      return error(res, 500, e.message, 'subjects_taxonomy_error');
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| MODE RULES
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/mode-rules/resolve',
+  async (req, res) => {
+    try {
+      const mode =
+        req.query.mode || 'practice';
+
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('mode_rules')
+          .select('*')
+          .eq('mode', mode)
+          .maybeSingle();
+
+      if (dbError) throw dbError;
+
+      if (!data) {
+        return response(res, {
+          rule: {
+            id: 'default-rule',
+            source: 'supabase',
+            mode,
+
+            minQuestions: 1,
+            maxQuestions: 30,
+
+            timerType: 'none',
+
+            allowResume: true,
+            allowSkip: true,
+            allowInstantFeedback: true,
+            allowExplanation: true,
+          },
+        });
+      }
+
+      return response(res, {
+        rule: {
+          id: data.id,
+          source: data.source,
+          mode: data.mode,
+
+          minQuestions:
+            data.min_questions,
+          maxQuestions:
+            data.max_questions,
+
+          timerType:
+            data.timer_type,
+
+          allowResume:
+            data.allow_resume,
+          allowSkip:
+            data.allow_skip,
+          allowInstantFeedback:
+            data.allow_instant_feedback,
+          allowExplanation:
+            data.allow_explanation,
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'mode_rules_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| PRACTICE BUILDER
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/practice-builder/metadata',
+  auth,
+  async (req, res) => {
+    try {
+      const examId =
+        req.body?.examId ||
+        'jee-main';
+
+      const [
+        setsResult,
+        subjectsResult,
+        rulesResult,
+      ] = await Promise.all([
+        supabaseAdmin
+          .from('sets')
+          .select('*')
+          .eq('exam_id', examId)
+          .eq('is_published', true),
+
+        supabaseAdmin
+          .from('subjects')
+          .select('*')
+          .eq('exam_id', examId)
+          .order('display_order', {
+            ascending: true,
+          }),
+
+        supabaseAdmin
+          .from('mode_rules')
+          .select('*')
+          .eq(
+            'mode',
+            req.body?.mode || 'practice'
+          )
+          .maybeSingle(),
+      ]);
+
+      if (setsResult.error)
+        throw setsResult.error;
+
+      if (subjectsResult.error)
+        throw subjectsResult.error;
+
+      if (rulesResult.error)
+        throw rulesResult.error;
+
+      const sets =
+        setsResult.data || [];
+
+      const subjects =
+        subjectsResult.data || [];
+
+      const rule =
+        rulesResult.data || null;
+
+      const totalQuestions =
+        sets.reduce(
+          (sum, set) =>
+            sum +
+            Number(
+              set.total_questions || 0
+            ),
+          0
+        );
+
+      return response(res, {
+        examId,
+
+        sets: sets.map(
+          (row) => ({
+            id: row.id,
+            name: row.name,
+            examId: row.exam_id,
+            examName: row.exam_name,
+            setType: row.set_type,
+            year: row.year,
+            totalQuestions:
+              row.total_questions,
+            isFree: row.is_free,
+            isPublished:
+              row.is_published,
+            accessStatus:
+              row.access_status,
+          })
+        ),
+
+        examStrategies: [
+          {
+            id: 'balanced',
+            code: 'BALANCED',
+            name: 'Balanced',
+            correctMarks: 4,
+            wrongMarks: -1,
+            skipMarks: 0,
+          },
+        ],
+
+        taxonomyNodes:
+          subjects.map(
+            (row) => ({
+              id: row.id,
+              name: row.name,
+              examId: row.exam_id,
+              questionCount:
+                row.question_count,
+              nodeType: row.node_type,
+              slug: row.slug,
+              displayOrder:
+                row.display_order,
+            })
+          ),
+
+        setPoolQuestions:
+          totalQuestions,
+
+        availableQuestions:
+          totalQuestions,
+
+        maxQuestions:
+          rule?.max_questions || 30,
+
+        hasPremium: false,
+
+        modeRule: {
+          source:
+            rule?.source || 'supabase',
+
+          mode:
+            rule?.mode ||
+            req.body?.mode ||
+            'practice',
+
+          minQuestions:
+            rule?.min_questions || 1,
+
+          maxQuestions:
+            rule?.max_questions || 30,
+
+          timerType:
+            rule?.timer_type || 'none',
+
+          allowResume:
+            rule?.allow_resume ?? true,
+
+          allowSkip:
+            rule?.allow_skip ?? true,
+
+          allowInstantFeedback:
+            rule?.allow_instant_feedback ??
+            true,
+
+          allowExplanation:
+            rule?.allow_explanation ??
+            true,
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'practice_builder_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REVISION SUMMARY
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/revision/summary',
+  auth,
+  async (req, res) => {
+    try {
+      return response(
+        res,
+        await revisionSummary(
+          req.user.id
+        )
+      );
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'revision_summary_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REVISION QUEUE
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/revision/queue',
+  auth,
+  async (req, res) => {
+    try {
+      const sources = String(
+        req.query.sources || 'wrong'
+      )
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+      const questions = await queueFor(
+        req.user.id,
+        sources
+      );
+
+      return response(res, {
+        questions,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'revision_queue_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REVISION MARK
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/revision/mark',
+  auth,
+  async (req, res) => {
+    try {
+      const {
+        questionId,
+        marked,
+      } = req.body || {};
+
+      if (!questionId) {
+        return error(
+          res,
+          400,
+          'questionId is required.'
+        );
+      }
+
+      const { data: question } =
+        await supabaseAdmin
+          .from('questions')
+          .select('id')
+          .eq(
+            'question_id',
+            questionId
+          )
+          .maybeSingle();
+
+      if (!question) {
+        return error(
+          res,
+          400,
+          'Unknown questionId.'
+        );
+      }
+
+      const enabled =
+        marked === true;
+
+      const { error: markError } =
+        await supabaseAdmin
+          .from('revision_marks')
+          .upsert(
+            {
+              user_id: req.user.id,
+              question_id: question.id,
+              marked: enabled,
+              updated_at: now(),
+            },
+            {
+              onConflict:
+                'user_id,question_id',
+            }
+          );
+
+      if (markError) throw markError;
+
+      if (enabled) {
+        const { error } =
+          await supabaseAdmin
+            .from('revision_questions')
+            .upsert(
+              {
+                user_id: req.user.id,
+                question_id: question.id,
+                source: 'manual',
+              },
+              {
+                onConflict:
+                  'user_id,question_id,source',
+              }
+            );
+
+        if (error) throw error;
+      } else {
+        await supabaseAdmin
+          .from('revision_questions')
+          .delete()
+          .eq('user_id', req.user.id)
+          .eq(
+            'question_id',
+            question.id
+          )
+          .eq('source', 'manual');
+      }
+
+      return response(res, {
+        questionId,
+        userId: req.user.id,
+        marked: enabled,
+
+        row: {
+          questionId,
+          userId: req.user.id,
+          marked: enabled,
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'revision_mark_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| BOOKMARKS
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/bookmarks',
+  auth,
+  async (req, res) => {
+    try {
+      const {
+        questionId,
+        bookmarked,
+      } = req.body || {};
+
+      if (!questionId) {
+        return error(
+          res,
+          400,
+          'questionId is required.'
+        );
+      }
+
+      const { data: question } =
+        await supabaseAdmin
+          .from('questions')
+          .select('id')
+          .eq(
+            'question_id',
+            questionId
+          )
+          .maybeSingle();
+
+      if (!question) {
+        return error(
+          res,
+          400,
+          'Unknown questionId.'
+        );
+      }
+
+      const enabled =
+        bookmarked === true;
+
+      if (enabled) {
+        const { error } =
+          await supabaseAdmin
+            .from('bookmarks')
+            .upsert(
+              {
+                user_id: req.user.id,
+                question_id: question.id,
+              },
+              {
+                onConflict:
+                  'user_id,question_id',
+              }
+            );
+
+        if (error) throw error;
+      } else {
+        const { error } =
+          await supabaseAdmin
+            .from('bookmarks')
+            .delete()
+            .eq(
+              'user_id',
+              req.user.id
+            )
+            .eq(
+              'question_id',
+              question.id
+            );
+
+        if (error) throw error;
+      }
+
+      return response(res, {
+        questionId,
+        bookmarked: enabled,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'bookmark_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REVISION SESSION
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/revision/session',
+  auth,
+  async (req, res) => {
+    try {
+      const sources =
+        Array.isArray(req.body?.sources) &&
+        req.body.sources.length
+          ? req.body.sources
+          : ['wrong'];
+
+      const limit = Math.min(
+        Math.max(
+          number(req.body?.limit, 50),
+          1
+        ),
+        50
+      );
+
+      const questions = (
+        await queueFor(
+          req.user.id,
+          sources
+        )
+      ).slice(0, limit);
+
+      if (!questions.length) {
+        return error(
+          res,
+          400,
+          'No revision questions available.',
+          'revision_empty'
+        );
+      }
+
+      const session =
+        await makeSession(
+          req.user.id,
+
+          questions.map(
+            (q) => q.id
+          ),
+
+          'review',
+          'revision',
+
+          req.body || {}
+        );
+
+      return response(res, {
+        session,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'revision_session_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ANALYTICS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/analytics/learning',
+  auth,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user.id;
+
+      const [
+        sessionsResult,
+        weakResult,
+      ] = await Promise.all([
+        supabaseAdmin
+          .from('sessions')
+          .select('*')
+          .eq('user_id', userId)
+          .order('created_at', {
+            ascending: false,
+          }),
+
+        supabaseAdmin
+          .from('weak_topics')
+          .select(`
+            *,
+            question:questions(
+              question_id
+            )
+          `)
+          .eq('user_id', userId),
+      ]);
+
+      if (sessionsResult.error)
+        throw sessionsResult.error;
+
+      if (weakResult.error)
+        throw weakResult.error;
+
+      const sessions =
+        sessionsResult.data || [];
+
+      const completed =
+        sessions.filter(
+          (s) =>
+            s.status === 'COMPLETED'
+        );
+
+      const percentages =
+        completed
+          .map((s) =>
+            Number(
+              s.percentage || 0
+            )
+          );
+
+      const average =
+        percentages.length
+          ? Math.round(
+              percentages.reduce(
+                (a, b) => a + b,
+                0
+              ) /
+                percentages.length
+            )
+          : 0;
+
+      const totalCorrect =
+        completed.reduce(
+          (sum, s) => sum + Number(s.total_correct || 0),
+          0
+        );
+
+      const totalWrong =
+        completed.reduce(
+          (sum, s) => sum + Number(s.total_wrong || 0),
+          0
+        );
+
+      const totalAnswered = totalCorrect + totalWrong;
+
+      const modeMap = new Map();
+      for (const session of completed) {
+        const key = session.mode || 'practice';
+        const current = modeMap.get(key) || {
+          mode: key,
+          sessions: 0,
+          totalQuestions: 0,
+          percentageTotal: 0,
+          scoreTotal: 0,
+        };
+        current.sessions += 1;
+        current.totalQuestions += Number(session.total_questions || 0);
+        current.percentageTotal += Number(session.percentage || 0);
+        current.scoreTotal += Number(session.score || 0);
+        modeMap.set(key, current);
+      }
+
+      const modeWisePerformance = [...modeMap.values()].map((item) => ({
+        mode: item.mode,
+        sessions: item.sessions,
+        averagePercentage:
+          item.sessions > 0
+            ? Number((item.percentageTotal / item.sessions).toFixed(2))
+            : 0,
+        averageScore:
+          item.sessions > 0
+            ? Number((item.scoreTotal / item.sessions).toFixed(2))
+            : 0,
+        totalQuestions: item.totalQuestions,
+      }));
+
+      const weakTopics =
+        (weakResult.data || []).map(
+          (row) => ({
+            questionId:
+              row.question?.question_id ||
+              null,
+
+            topic:
+              row.topic_name ||
+              row.topic_id ||
+              'Unknown',
+
+            score:
+              row.score !== null
+                ? Number(row.score)
+                : null,
+          })
+        );
+
+      return response(res, {
+        analytics: {
+          // Attempts means answered questions, matching the mobile UI.
+          totalAttempts:
+            totalAnswered,
+
+          correctAttempts:
+            totalCorrect,
+
+          // Mobile UI renders this value directly as a percentage.
+          correctRate:
+            totalAnswered
+              ? Number(((totalCorrect / totalAnswered) * 100).toFixed(2))
+              : 0,
+
+          completedSessions:
+            completed.length,
+
+          recentAveragePercentage:
+            average,
+
+          weakTopics,
+
+          topWeakSubjects: [],
+
+          modeWisePerformance,
+
+          recentScoreTrend:
+            completed
+              .slice(0, 10)
+              .reverse()
+              .map((s, index) => ({
+                sessionId: s.id,
+                label: `S${index + 1}`,
+
+                mode: s.mode,
+
+                percentage:
+                  Number(
+                    s.percentage || 0
+                  ),
+
+                score:
+                  Number(
+                    s.score || 0
+                  ),
+
+                submittedAt:
+                  s.submitted_at,
+              })),
+
+          lastSessions:
+            sessions
+              .slice(0, 5)
+              .map(
+                historyFromSession
+              ),
+        },
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'analytics_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SESSIONS - HISTORY
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/sessions',
+  auth,
+  async (req, res) => {
+    try {
+      let query = supabaseAdmin
+        .from('sessions')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .order('created_at', {
+          ascending: false,
+        });
+
+      if (req.query.status) {
+        query = query.eq(
+          'status',
+          req.query.status
+        );
+      }
+
+      const { data, error: dbError } =
+        await query;
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        sessions: (data || []).map(
+          historyFromSession
+        ),
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'sessions_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CREATE SESSION
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/sessions',
+  auth,
+  async (req, res) => {
+    try {
+      const limit = Math.min(
+        Math.max(
+          number(
+            req.body?.limit,
+            10
+          ),
+          1
+        ),
+        30
+      );
+
+      let questionIds = [];
+
+      /*
+       * If setId is provided, use questions
+       * belonging to that set.
+       */
+      if (req.body?.setId) {
+        const { data, error: dbError } =
+          await supabaseAdmin
+            .from('set_questions')
+            .select(`
+              question_id,
+              position
+            `)
+            .eq(
+              'set_id',
+              req.body.setId
+            )
+            .order('position', {
+              ascending: true,
+            })
+            .limit(limit);
+
+        if (dbError) throw dbError;
+
+        questionIds =
+          (data || []).map(
+            (row) =>
+              row.question_id
+          );
+      } else {
+        /*
+         * Fallback: latest questions.
+         */
+        const { data, error: dbError } =
+          await supabaseAdmin
+            .from('questions')
+            .select('id')
+            .order('created_at', {
+              ascending: true,
+            })
+            .limit(limit);
+
+        if (dbError) throw dbError;
+
+        questionIds =
+          (data || []).map(
+            (row) => row.id
+          );
+      }
+
+      if (!questionIds.length) {
+        return error(
+          res,
+          400,
+          'No questions available.',
+          'no_questions'
+        );
+      }
+
+      const session =
+        await makeSession(
+          req.user.id,
+          questionIds,
+          req.body?.mode ||
+            'practice',
+          req.body?.sessionType ||
+            'set_based',
+          req.body || {}
+        );
+
+      return response(res, {
+        session,
+      });
+    } catch (e) {
+      console.error(e);
+
+      return error(
+        res,
+        500,
+        e.message,
+        'session_create_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET SESSION
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/sessions/:sessionId',
+  auth,
+  async (req, res) => {
+    try {
+      const session =
+        await loadSession(
+          req.params.sessionId,
+          req.user.id
+        );
+
+      if (!session) {
+        return error(
+          res,
+          404,
+          'Session not found.',
+          'session_not_found'
+        );
+      }
+
+      return response(res, {
+        session,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'session_get_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ANSWER SESSION QUESTION
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/sessions/:sessionId/answer',
+  auth,
+  async (req, res) => {
+    try {
+      const { data: session } =
+        await supabaseAdmin
+          .from('sessions')
+          .select(
+            'id,status,is_submitted'
+          )
+          .eq(
+            'id',
+            req.params.sessionId
+          )
+          .eq(
+            'user_id',
+            req.user.id
+          )
+          .maybeSingle();
+
+      if (!session) {
+        return error(
+          res,
+          404,
+          'Session not found.',
+          'session_not_found'
+        );
+      }
+
+      if (
+        session.is_submitted ||
+        session.status === 'COMPLETED'
+      ) {
+        return error(
+          res,
+          400,
+          'Session has already been submitted.',
+          'session_completed'
+        );
+      }
+
+      const updated =
+        await applyAnswer(
+          req.params.sessionId,
+          req.user.id,
+          req.body || {}
+        );
+
+      return response(res, {
+        session: updated,
+      });
+    } catch (e) {
+      console.error('Answer endpoint error:', e);
+      return error(
+        res,
+        400,
+        e.message || 'Unable to save answer.',
+        'answer_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SUBMIT SESSION
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/sessions/:sessionId/submit',
+  auth,
+  async (req, res) => {
+    try {
+      const { data: session } =
+        await supabaseAdmin
+          .from('sessions')
+          .select('id')
+          .eq(
+            'id',
+            req.params.sessionId
+          )
+          .eq(
+            'user_id',
+            req.user.id
+          )
+          .maybeSingle();
+
+      if (!session) {
+        return error(
+          res,
+          404,
+          'Session not found.',
+          'session_not_found'
+        );
+      }
+
+      const result =
+        await submitSession(
+          req.params.sessionId,
+          req.user.id
+        );
+
+      return response(res, {
+        session: result,
+      });
+    } catch (e) {
+      console.error(e);
+
+      return error(
+        res,
+        500,
+        e.message,
+        'session_submit_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| RESUME SESSION
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/sessions/:sessionId/resume',
+  auth,
+  async (req, res) => {
+    try {
+      const { data: session, error: dbError } =
+        await supabaseAdmin
+          .from('sessions')
+          .update({
+            status: 'IN_PROGRESS',
+            is_submitted: false,
+            last_activity_at: now(),
+          })
+          .eq(
+            'id',
+            req.params.sessionId
+          )
+          .eq(
+            'user_id',
+            req.user.id
+          )
+          .select('*')
+          .maybeSingle();
+
+      if (dbError) throw dbError;
+
+      if (!session) {
+        return error(
+          res,
+          404,
+          'Session not found.',
+          'session_not_found'
+        );
+      }
+
+      const fullSession =
+        await loadSession(
+          session.id,
+          req.user.id
+        );
+
+      return response(res, {
+        session: fullSession,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'session_resume_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ORDER INTENT
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  '/api/orders/create-intent',
+  auth,
+  async (req, res) => {
+    try {
+      const {
+        items = [],
+      } = req.body || {};
+
+      const { data, error: dbError } =
+        await supabaseAdmin
+          .from('order_intents')
+          .insert({
+            user_id: req.user.id,
+            status: 'CREATED',
+            items,
+            payment_url: null,
+          })
+          .select('*')
+          .single();
+
+      if (dbError) throw dbError;
+
+      return response(res, {
+        id: data.id,
+        status: data.status,
+        paymentUrl: data.payment_url,
+        message:
+          'Supabase order intent created.',
+        items: data.items,
+        createdAt: data.created_at,
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'order_error'
+      );
+    }
+  }
+);
+
+
+
+
+
+
+
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN APIs
+|--------------------------------------------------------------------------
+|
+| All admin writes go through the Supabase service-role client after
+| adminAuth has verified the Supabase access token + ADMIN_EMAILS.
+|
+| Contract:
+| - Request fields use camelCase.
+| - A small snake_case compatibility layer is accepted on writes.
+| - Responses are normalized to the same camelCase contract used by
+|   the public APIs.
+| - Content counters are recalculated after content mutations so the
+|   public fetch APIs do not depend on manually maintained counts.
+|
+*/
+
+// =========================================================
+// ADMIN HELPERS
+// =========================================================
+
+function bodyValue(body, camelName, snakeName, fallback = undefined) {
+  if (body && body[camelName] !== undefined) return body[camelName];
+  if (body && snakeName && body[snakeName] !== undefined) {
+    return body[snakeName];
+  }
+  return fallback;
+}
+
+function requiredText(value, field) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    const err = new Error(`${field} is required.`);
+    err.status = 400;
+    err.code = 'missing_field';
+    throw err;
+  }
+  return String(value).trim();
+}
+
+function optionalText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text === '' ? null : text;
+}
+
+function nullableNumber(value, fallback = null) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function positiveInt(value, fallback = 1) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? n : fallback;
+}
+
+function adminDbError(e, fallbackCode) {
+  const rawMessage = String(e?.message || 'Database operation failed.');
+  const isRls =
+    e?.code === '42501' ||
+    /row-level security policy/i.test(rawMessage) ||
+    /violates row-level security/i.test(rawMessage);
+
+  const code = isRls ? 'admin_db_key_not_privileged' : (e?.code || e?.details || fallbackCode);
+  const status =
+    e?.status ||
+    (isRls ? 503 : e?.code === '23505' ? 409 : e?.code === '23503' ? 400 : 400);
+
+  return {
+    status,
+    message: isRls
+      ? 'Admin database access is not using a privileged Supabase Secret/service_role key. Set SUPABASE_SECRET_KEY (sb_secret_...) or SUPABASE_SERVICE_ROLE_KEY to the Supabase service_role key on the Express server, then restart it.'
+      : rawMessage,
+    code,
+  };
+}
+
+function adminFail(res, e, fallbackCode, fallbackStatus = 400) {
+  const info = adminDbError(e, fallbackCode);
+  return error(
+    res,
+    info.status || fallbackStatus,
+    info.message,
+    info.code || fallbackCode
+  );
+}
+
+function ensureNonEmptyUpdate(update) {
+  if (!Object.keys(update).length) {
+    const err = new Error('No fields supplied for update.');
+    err.status = 400;
+    err.code = 'empty_update';
+    throw err;
+  }
+}
+
+function mapExam(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    code: row.code,
+    shortName: row.short_name,
+    description: row.description,
+    isActive: Boolean(row.is_active),
+    isFeatured: Boolean(row.is_featured),
+    displayOrder: Number(row.display_order || 0),
+    totalSets: Number(row.total_sets || 0),
+    totalQuestionsAvailable: Number(row.total_questions_available || 0),
+    freeSets: Number(row.free_sets || 0),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapSubject(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    examId: row.exam_id,
+    questionCount: Number(row.question_count || 0),
+    nodeType: row.node_type,
+    slug: row.slug,
+    displayOrder: Number(row.display_order || 0),
+    createdAt: row.created_at || null,
+  };
+}
+
+function mapTaxonomyNode(row) {
+  return {
+    id: row.id,
+    parentId: row.parent_id,
+    subjectId: row.subject_id,
+    examId: row.exam_id,
+    name: row.name,
+    nodeType: row.node_type,
+    slug: row.slug,
+    displayOrder: Number(row.display_order || 0),
+    createdAt: row.created_at || null,
+  };
+}
+
+function mapSet(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    examId: row.exam_id,
+    subjectId: row.subject_id,
+    examName: row.exam_name,
+    setType: row.set_type,
+    year: row.year,
+    totalQuestions: Number(row.total_questions || 0),
+    isFree: Boolean(row.is_free),
+    isPublished: Boolean(row.is_published),
+    accessStatus: row.access_status,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapQuestionAdmin(row) {
+  return {
+    id: row.id,
+    questionId: row.question_id,
+    stem: row.stem,
+    questionType: row.question_type,
+    difficulty: row.difficulty,
+    sourceYear: row.source_year,
+    examName: row.exam_name,
+    examId: row.exam_id,
+    subjectId: row.subject_id,
+    topicId: row.topic_id,
+    options: row.options || {},
+    correctOption: row.correct_option,
+    explanation: row.explanation,
+    imageUrl: row.image_url,
+    hasImage: Boolean(row.has_image),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapBanner(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    subtitle: row.subtitle,
+    imageUrl: row.image_url,
+    isActive: Boolean(row.is_active),
+    sortOrder: Number(row.sort_order || 0),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapPlan(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    durationDays: Number(row.duration_days || 0),
+    price: row.price === null ? null : String(row.price),
+    mrp: row.mrp === null ? null : String(row.mrp),
+    currency: row.currency,
+    isActive: Boolean(row.is_active),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapProduct(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    category: row.category,
+    type: row.type,
+    price: row.price === null ? null : String(row.price),
+    salePrice: row.sale_price === null ? null : String(row.sale_price),
+    mrp: row.mrp === null ? null : String(row.mrp),
+    currency: row.currency,
+    stock: row.stock,
+    isActive: Boolean(row.is_active),
+    featured: Boolean(row.featured),
+    imageUrl: row.image_url,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapModeRule(row) {
+  return {
+    id: row.id,
+    source: row.source,
+    mode: row.mode,
+    minQuestions: Number(row.min_questions || 1),
+    maxQuestions: Number(row.max_questions || 30),
+    timerType: row.timer_type,
+    allowResume: Boolean(row.allow_resume),
+    allowSkip: Boolean(row.allow_skip),
+    allowInstantFeedback: Boolean(row.allow_instant_feedback),
+    allowExplanation: Boolean(row.allow_explanation),
+    createdAt: row.created_at || null,
+  };
+}
+
+async function assertExists(table, column, value, label) {
+  const { data, error: dbError } = await supabaseAdmin
+    .from(table)
+    .select(column)
+    .eq(column, value)
+    .maybeSingle();
+
+  if (dbError) throw dbError;
+  if (!data) {
+    const err = new Error(`${label || table} not found.`);
+    err.status = 404;
+    err.code = `${table}_not_found`;
+    throw err;
+  }
+  return data;
+}
+
+async function refreshExamCounts(examIds = []) {
+  const ids = [...new Set((examIds || []).filter(Boolean))];
+  for (const examId of ids) {
+    const [setsResult, questionsResult, freeSetsResult] = await Promise.all([
+      supabaseAdmin
+        .from('sets')
+        .select('id', { count: 'exact', head: true })
+        .eq('exam_id', examId),
+
+      supabaseAdmin
+        .from('questions')
+        .select('id', { count: 'exact', head: true })
+        .eq('exam_id', examId),
+
+      supabaseAdmin
+        .from('sets')
+        .select('id', { count: 'exact', head: true })
+        .eq('exam_id', examId)
+        .eq('is_free', true),
+    ]);
+
+    if (setsResult.error) throw setsResult.error;
+    if (questionsResult.error) throw questionsResult.error;
+    if (freeSetsResult.error) throw freeSetsResult.error;
+
+    const { error: updateError } = await supabaseAdmin
+      .from('exams')
+      .update({
+        total_sets: setsResult.count || 0,
+        total_questions_available: questionsResult.count || 0,
+        free_sets: freeSetsResult.count || 0,
+        updated_at: now(),
+      })
+      .eq('id', examId);
+
+    if (updateError) throw updateError;
+  }
+}
+
+async function refreshSubjectCounts(subjectIds = []) {
+  const ids = [...new Set((subjectIds || []).filter(Boolean))];
+
+  for (const subjectId of ids) {
+    const { count, error: countError } = await supabaseAdmin
+      .from('questions')
+      .select('id', { count: 'exact', head: true })
+      .eq('subject_id', subjectId);
+
+    if (countError) throw countError;
+
+    const { error: updateError } = await supabaseAdmin
+      .from('subjects')
+      .update({
+        question_count: count || 0,
+      })
+      .eq('id', subjectId);
+
+    if (updateError) throw updateError;
+  }
+}
+
+async function refreshSetCount(setId) {
+  const { count, error: countError } = await supabaseAdmin
+    .from('set_questions')
+    .select('id', { count: 'exact', head: true })
+    .eq('set_id', setId);
+
+  if (countError) throw countError;
+
+  const { data: set, error: setError } = await supabaseAdmin
+    .from('sets')
+    .select('exam_id')
+    .eq('id', setId)
+    .maybeSingle();
+
+  if (setError) throw setError;
+
+  const { error: updateError } = await supabaseAdmin
+    .from('sets')
+    .update({
+      total_questions: count || 0,
+      updated_at: now(),
+    })
+    .eq('id', setId);
+
+  if (updateError) throw updateError;
+
+  if (set?.exam_id) {
+    await refreshExamCounts([set.exam_id]);
+  }
+
+  return count || 0;
+}
+
+function questionPayload(body = {}) {
+  const questionId = bodyValue(body, 'questionId', 'question_id');
+  const stem = bodyValue(body, 'stem');
+  const questionType = bodyValue(
+    body,
+    'questionType',
+    'question_type',
+    'MCQ'
+  );
+  const difficulty = bodyValue(body, 'difficulty', 'difficulty', 1);
+  const sourceYear = bodyValue(body, 'sourceYear', 'source_year');
+  const examName = bodyValue(body, 'examName', 'exam_name');
+  const examId = bodyValue(body, 'examId', 'exam_id');
+  const subjectId = bodyValue(body, 'subjectId', 'subject_id');
+  const topicId = bodyValue(body, 'topicId', 'topic_id');
+  const options = bodyValue(body, 'options', 'options', {});
+  const correctOption = bodyValue(
+    body,
+    'correctOption',
+    'correct_option',
+    null
+  );
+  const explanation = bodyValue(body, 'explanation');
+  const imageUrl = bodyValue(body, 'imageUrl', 'image_url');
+  const hasImage = bodyValue(
+    body,
+    'hasImage',
+    'has_image',
+    Boolean(imageUrl)
+  );
+
+  const cleanStem = requiredText(stem, 'stem');
+
+  if (String(questionType).toUpperCase() === 'MCQ' &&
+      (correctOption === undefined ||
+       correctOption === null ||
+       String(correctOption).trim() === '')) {
+    const err = new Error('correctOption is required for MCQ questions.');
+    err.status = 400;
+    err.code = 'missing_correct_option';
+    throw err;
+  }
+
+  if (String(questionType).toUpperCase() === 'MCQ') {
+    const invalidOptions =
+      options === null ||
+      typeof options !== 'object' ||
+      (Array.isArray(options) && options.length === 0) ||
+      (!Array.isArray(options) &&
+        Object.keys(options).length === 0);
+
+    if (invalidOptions) {
+      const err = new Error('options must be a non-empty JSON object/array for MCQ questions.');
+      err.status = 400;
+      err.code = 'invalid_options';
+      throw err;
+    }
+  }
+
+  return {
+    question_id: requiredText(questionId, 'questionId'),
+    stem: cleanStem,
+    question_type: String(questionType),
+    difficulty: nullableNumber(difficulty, 1),
+    source_year: nullableNumber(sourceYear),
+    exam_name: optionalText(examName),
+    exam_id: optionalText(examId),
+    subject_id: optionalText(subjectId),
+    topic_id: optionalText(topicId),
+    options,
+    correct_option: optionalText(correctOption),
+    explanation: optionalText(explanation),
+    image_url: optionalText(imageUrl),
+    has_image: Boolean(hasImage),
+  };
+}
+
+function setPayload(body = {}) {
+  return {
+    name: requiredText(
+      bodyValue(body, 'name'),
+      'name'
+    ),
+    exam_id: requiredText(
+      bodyValue(body, 'examId', 'exam_id'),
+      'examId'
+    ),
+    exam_name: optionalText(
+      bodyValue(body, 'examName', 'exam_name')
+    ),
+    subject_id: optionalText(
+      bodyValue(body, 'subjectId', 'subject_id')
+    ),
+    set_type: String(
+      bodyValue(body, 'setType', 'set_type', 'PYQ')
+    ),
+    year: nullableNumber(
+      bodyValue(body, 'year'),
+      null
+    ),
+    total_questions: 0,
+    is_free: Boolean(
+      bodyValue(body, 'isFree', 'is_free', false)
+    ),
+    is_published: Boolean(
+      bodyValue(body, 'isPublished', 'is_published', false)
+    ),
+    access_status: String(
+      bodyValue(body, 'accessStatus', 'access_status', 'locked')
+    ),
+  };
+}
+
+async function replaceSetQuestions(setId, questionIds = []) {
+  const uniqueIds = [...new Set(
+    (questionIds || []).filter(Boolean).map(String)
+  )];
+
+  if (!uniqueIds.length) {
+    await supabaseAdmin
+      .from('set_questions')
+      .delete()
+      .eq('set_id', setId);
+
+    return [];
+  }
+
+  const { data: questions, error: questionError } = await supabaseAdmin
+    .from('questions')
+    .select('id')
+    .in('id', uniqueIds);
+
+  if (questionError) throw questionError;
+
+  const found = new Set((questions || []).map((q) => q.id));
+  const missing = uniqueIds.filter((qid) => !found.has(qid));
+
+  if (missing.length) {
+    const err = new Error(
+      `Question(s) not found: ${missing.join(', ')}`
+    );
+    err.status = 404;
+    err.code = 'questions_not_found';
+    throw err;
+  }
+
+  const rows = uniqueIds.map((questionId, index) => ({
+    set_id: setId,
+    question_id: questionId,
+    position: index + 1,
+  }));
+
+  const { error: deleteError } = await supabaseAdmin
+    .from('set_questions')
+    .delete()
+    .eq('set_id', setId);
+
+  if (deleteError) throw deleteError;
+
+  const { data, error: insertError } = await supabaseAdmin
+    .from('set_questions')
+    .insert(rows)
+    .select('*')
+    .order('position', { ascending: true });
+
+  if (insertError) throw insertError;
+
+  return data || [];
+}
+
+// =========================================================
+// ADMIN - DATABASE DIAGNOSTICS
+// =========================================================
+
+app.get('/api/admin/diagnostics', adminAuth, async (req, res) => {
+  try {
+    // A tiny privileged read confirms the backend is using the admin client.
+    const { error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .select('id')
+      .limit(1);
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      ok: true,
+      database: 'connected',
+      adminClient: 'privileged',
+      writes: 'server-side only',
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_database_diagnostics_error', 503);
+  }
+});
+
+// =========================================================
+// ADMIN - DASHBOARD
+// =========================================================
+
+app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
+  try {
+    const [
+      exams,
+      subjects,
+      taxonomy,
+      sets,
+      questions,
+      users,
+      sessions,
+      products,
+      plans,
+      banners,
+    ] = await Promise.all([
+      supabaseAdmin.from('exams').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('subjects').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('taxonomy_nodes').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('sets').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('questions').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('profiles').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('sessions').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('market_products').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('subscription_plans').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('banners').select('id', { count: 'exact', head: true }),
+    ]);
+
+    for (const result of [
+      exams, subjects, taxonomy, sets, questions,
+      users, sessions, products, plans, banners,
+    ]) {
+      if (result.error) throw result.error;
+    }
+
+    return response(res, {
+      stats: {
+        exams: exams.count || 0,
+        subjects: subjects.count || 0,
+        taxonomyNodes: taxonomy.count || 0,
+        sets: sets.count || 0,
+        questions: questions.count || 0,
+        users: users.count || 0,
+        sessions: sessions.count || 0,
+        products: products.count || 0,
+        subscriptionPlans: plans.count || 0,
+        banners: banners.count || 0,
+      },
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_dashboard_error', 500);
+  }
+});
+
+// =========================================================
+// ADMIN - EXAMS
+// =========================================================
+
+app.get('/api/admin/exams', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('exams')
+      .select('*')
+      .order('display_order', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (req.query.active !== undefined) {
+      query = query.eq('is_active', String(req.query.active) === 'true');
+    }
+
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    return response(res, {
+      exams: (data || []).map(mapExam),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_exams_error', 500);
+  }
+});
+
+app.post('/api/admin/exams', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const examId = requiredText(bodyValue(body, 'id'), 'id');
+    const name = requiredText(bodyValue(body, 'name'), 'name');
+
+    const payload = {
+      id: examId,
+      name,
+      code: optionalText(bodyValue(body, 'code')),
+      short_name: optionalText(bodyValue(body, 'shortName', 'short_name')),
+      description: optionalText(bodyValue(body, 'description')),
+      is_active: Boolean(bodyValue(body, 'isActive', 'is_active', true)),
+      is_featured: Boolean(bodyValue(body, 'isFeatured', 'is_featured', false)),
+      display_order: number(bodyValue(body, 'displayOrder', 'display_order', 0)),
+      total_sets: 0,
+      total_questions_available: 0,
+      free_sets: 0,
+    };
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('exams')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { exam: mapExam(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_exam_create_error');
+  }
+});
+
+app.patch('/api/admin/exams/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('exams', 'id', req.params.id, 'Exam');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name !== undefined) update.name = requiredText(body.name, 'name');
+    if (body.code !== undefined) update.code = optionalText(body.code);
+    if (body.shortName !== undefined || body.short_name !== undefined) {
+      update.short_name = optionalText(bodyValue(body, 'shortName', 'short_name'));
+    }
+    if (body.description !== undefined) update.description = optionalText(body.description);
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      update.is_active = Boolean(bodyValue(body, 'isActive', 'is_active'));
+    }
+    if (body.isFeatured !== undefined || body.is_featured !== undefined) {
+      update.is_featured = Boolean(bodyValue(body, 'isFeatured', 'is_featured'));
+    }
+    if (body.displayOrder !== undefined || body.display_order !== undefined) {
+      update.display_order = number(bodyValue(body, 'displayOrder', 'display_order', 0));
+    }
+
+    ensureNonEmptyUpdate(update);
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('exams')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { exam: mapExam(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_exam_update_error');
+  }
+});
+
+app.delete('/api/admin/exams/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('exams', 'id', req.params.id, 'Exam');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('exams')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_exam_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - SUBJECTS
+// =========================================================
+
+app.get('/api/admin/subjects', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('subjects')
+      .select('*')
+      .order('display_order', { ascending: true })
+      .order('name', { ascending: true });
+
+    const examId = req.query.examId || req.query.exam_id;
+    if (examId) query = query.eq('exam_id', examId);
+
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    return response(res, {
+      subjects: (data || []).map(mapSubject),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_subjects_error', 500);
+  }
+});
+
+app.post('/api/admin/subjects', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const name = requiredText(bodyValue(body, 'name'), 'name');
+    const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
+
+    await assertExists('exams', 'id', examId, 'Exam');
+
+    const payload = {
+      id,
+      name,
+      exam_id: examId,
+      question_count: 0,
+      node_type: String(bodyValue(body, 'nodeType', 'node_type', 'SUBJECT')),
+      slug: optionalText(bodyValue(body, 'slug')),
+      display_order: number(bodyValue(body, 'displayOrder', 'display_order', 0)),
+    };
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('subjects')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { subject: mapSubject(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_subject_create_error');
+  }
+});
+
+app.patch('/api/admin/subjects/:id', adminAuth, async (req, res) => {
+  try {
+    const current = await assertExists('subjects', 'id', req.params.id, 'Subject');
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name !== undefined) update.name = requiredText(body.name, 'name');
+
+    if (body.examId !== undefined || body.exam_id !== undefined) {
+      const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
+      await assertExists('exams', 'id', examId, 'Exam');
+      update.exam_id = examId;
+    }
+
+    if (body.nodeType !== undefined || body.node_type !== undefined) {
+      update.node_type = String(bodyValue(body, 'nodeType', 'node_type'));
+    }
+    if (body.slug !== undefined) update.slug = optionalText(body.slug);
+    if (body.displayOrder !== undefined || body.display_order !== undefined) {
+      update.display_order = number(bodyValue(body, 'displayOrder', 'display_order', 0));
+    }
+
+    ensureNonEmptyUpdate(update);
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('subjects')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    if (current.exam_id !== data.exam_id) {
+      await refreshExamCounts([current.exam_id, data.exam_id]);
+    }
+
+    return response(res, { subject: mapSubject(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_subject_update_error');
+  }
+});
+
+app.delete('/api/admin/subjects/:id', adminAuth, async (req, res) => {
+  try {
+    const current = await assertExists('subjects', 'id', req.params.id, 'Subject');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('subjects')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    if (current.exam_id) await refreshExamCounts([current.exam_id]);
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_subject_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - TAXONOMY NODES
+// =========================================================
+
+app.get('/api/admin/taxonomy', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('taxonomy_nodes')
+      .select('*')
+      .order('display_order', { ascending: true })
+      .order('name', { ascending: true });
+
+    const examId = req.query.examId || req.query.exam_id;
+    const subjectId = req.query.subjectId || req.query.subject_id;
+    const parentId = req.query.parentId || req.query.parent_id;
+
+    if (examId) query = query.eq('exam_id', examId);
+    if (subjectId) query = query.eq('subject_id', subjectId);
+    if (parentId) query = query.eq('parent_id', parentId);
+
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    return response(res, {
+      nodes: (data || []).map(mapTaxonomyNode),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_taxonomy_error', 500);
+  }
+});
+
+app.get('/api/admin/taxonomy/:id', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('taxonomy_nodes')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (dbError) throw dbError;
+    if (!data) return error(res, 404, 'Taxonomy node not found.', 'taxonomy_not_found');
+
+    return response(res, { node: mapTaxonomyNode(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_taxonomy_get_error');
+  }
+});
+
+app.post('/api/admin/taxonomy', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const name = requiredText(bodyValue(body, 'name'), 'name');
+    const nodeType = requiredText(
+      bodyValue(body, 'nodeType', 'node_type'),
+      'nodeType'
+    );
+
+    const parentId = optionalText(bodyValue(body, 'parentId', 'parent_id'));
+    const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
+    const examId = optionalText(bodyValue(body, 'examId', 'exam_id'));
+
+    if (parentId) await assertExists('taxonomy_nodes', 'id', parentId, 'Parent taxonomy node');
+    if (subjectId) await assertExists('subjects', 'id', subjectId, 'Subject');
+    if (examId) await assertExists('exams', 'id', examId, 'Exam');
+
+    const payload = {
+      id,
+      parent_id: parentId,
+      subject_id: subjectId,
+      exam_id: examId,
+      name,
+      node_type: nodeType,
+      slug: optionalText(bodyValue(body, 'slug')),
+      display_order: number(bodyValue(body, 'displayOrder', 'display_order', 0)),
+    };
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('taxonomy_nodes')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { node: mapTaxonomyNode(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_taxonomy_create_error');
+  }
+});
+
+app.patch('/api/admin/taxonomy/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('taxonomy_nodes', 'id', req.params.id, 'Taxonomy node');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name !== undefined) update.name = requiredText(body.name, 'name');
+    if (body.nodeType !== undefined || body.node_type !== undefined) {
+      update.node_type = requiredText(
+        bodyValue(body, 'nodeType', 'node_type'),
+        'nodeType'
+      );
+    }
+    if (body.parentId !== undefined || body.parent_id !== undefined) {
+      const parentId = optionalText(bodyValue(body, 'parentId', 'parent_id'));
+      if (parentId) {
+        if (parentId === req.params.id) {
+          const err = new Error('A taxonomy node cannot be its own parent.');
+          err.status = 400;
+          err.code = 'invalid_parent';
+          throw err;
+        }
+        await assertExists('taxonomy_nodes', 'id', parentId, 'Parent taxonomy node');
+      }
+      update.parent_id = parentId;
+    }
+    if (body.subjectId !== undefined || body.subject_id !== undefined) {
+      const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
+      if (subjectId) await assertExists('subjects', 'id', subjectId, 'Subject');
+      update.subject_id = subjectId;
+    }
+    if (body.examId !== undefined || body.exam_id !== undefined) {
+      const examId = optionalText(bodyValue(body, 'examId', 'exam_id'));
+      if (examId) await assertExists('exams', 'id', examId, 'Exam');
+      update.exam_id = examId;
+    }
+    if (body.slug !== undefined) update.slug = optionalText(body.slug);
+    if (body.displayOrder !== undefined || body.display_order !== undefined) {
+      update.display_order = number(bodyValue(body, 'displayOrder', 'display_order', 0));
+    }
+
+    ensureNonEmptyUpdate(update);
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('taxonomy_nodes')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { node: mapTaxonomyNode(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_taxonomy_update_error');
+  }
+});
+
+app.delete('/api/admin/taxonomy/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('taxonomy_nodes', 'id', req.params.id, 'Taxonomy node');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('taxonomy_nodes')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_taxonomy_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - SETS
+// =========================================================
+
+app.get('/api/admin/sets', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('sets')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const examId = req.query.examId || req.query.exam_id;
+    const subjectId = req.query.subjectId || req.query.subject_id;
+    const setType = req.query.setType || req.query.set_type;
+
+    if (examId) query = query.eq('exam_id', examId);
+    if (subjectId) query = query.eq('subject_id', subjectId);
+    if (setType) query = query.eq('set_type', setType);
+    if (req.query.published !== undefined) {
+      query = query.eq('is_published', String(req.query.published) === 'true');
+    }
+
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    return response(res, {
+      sets: (data || []).map(mapSet),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_sets_error', 500);
+  }
+});
+
+app.get('/api/admin/sets/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: set, error: setError } = await supabaseAdmin
+      .from('sets')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (setError) throw setError;
+    if (!set) return error(res, 404, 'Set not found.', 'set_not_found');
+
+    const { data: rows, error: questionError } = await supabaseAdmin
+      .from('set_questions')
+      .select(`
+        set_id,
+        question_id,
+        position,
+        question:questions(*)
+      `)
+      .eq('set_id', req.params.id)
+      .order('position', { ascending: true });
+
+    if (questionError) throw questionError;
+
+    return response(res, {
+      set: mapSet(set),
+      questions: (rows || []).map((row) => ({
+        setId: row.set_id,
+        questionId: row.question_id,
+        position: row.position,
+        question: row.question ? mapQuestionAdmin(row.question) : null,
+      })),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_get_error', 500);
+  }
+});
+
+app.post('/api/admin/sets', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const payload = setPayload(body);
+
+    await assertExists('exams', 'id', payload.exam_id, 'Exam');
+    if (payload.subject_id) await assertExists('subjects', 'id', payload.subject_id, 'Subject');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('sets')
+      .insert({
+        id,
+        ...payload,
+      })
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    try {
+      if (Array.isArray(body.questionIds)) {
+        await replaceSetQuestions(id, body.questionIds);
+        await refreshSetCount(id);
+      } else {
+        await refreshExamCounts([payload.exam_id]);
+      }
+    } catch (e) {
+      await supabaseAdmin.from('sets').delete().eq('id', id);
+      throw e;
+    }
+
+    const { data: freshSet, error: freshError } = await supabaseAdmin
+      .from('sets')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (freshError) throw freshError;
+
+    return response(res, { set: mapSet(freshSet) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_create_error');
+  }
+});
+
+app.patch('/api/admin/sets/:id', adminAuth, async (req, res) => {
+  try {
+    const current = await assertExists('sets', 'id', req.params.id, 'Set');
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name !== undefined) update.name = requiredText(body.name, 'name');
+    if (body.examId !== undefined || body.exam_id !== undefined) {
+      const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
+      await assertExists('exams', 'id', examId, 'Exam');
+      update.exam_id = examId;
+    }
+    if (body.examName !== undefined || body.exam_name !== undefined) {
+      update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
+    }
+    if (body.subjectId !== undefined || body.subject_id !== undefined) {
+      const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
+      if (subjectId) await assertExists('subjects', 'id', subjectId, 'Subject');
+      update.subject_id = subjectId;
+    }
+    if (body.setType !== undefined || body.set_type !== undefined) {
+      update.set_type = String(bodyValue(body, 'setType', 'set_type'));
+    }
+    if (body.year !== undefined) update.year = nullableNumber(body.year);
+    if (body.isFree !== undefined || body.is_free !== undefined) {
+      update.is_free = Boolean(bodyValue(body, 'isFree', 'is_free'));
+    }
+    if (body.isPublished !== undefined || body.is_published !== undefined) {
+      update.is_published = Boolean(bodyValue(body, 'isPublished', 'is_published'));
+    }
+    if (body.accessStatus !== undefined || body.access_status !== undefined) {
+      update.access_status = String(bodyValue(body, 'accessStatus', 'access_status'));
+    }
+
+    const hasQuestionIds = Array.isArray(body.questionIds);
+
+    if (Object.keys(update).length) {
+      update.updated_at = now();
+      const { error: dbError } = await supabaseAdmin
+        .from('sets')
+        .update(update)
+        .eq('id', req.params.id);
+
+      if (dbError) throw dbError;
+    }
+
+    if (hasQuestionIds) {
+      await replaceSetQuestions(req.params.id, body.questionIds);
+    }
+
+    if (!Object.keys(update).length && !hasQuestionIds) {
+      ensureNonEmptyUpdate(update);
+    }
+
+    const examIds = [current.exam_id];
+    if (update.exam_id) examIds.push(update.exam_id);
+
+    await refreshSetCount(req.params.id);
+    await refreshExamCounts(examIds);
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('sets')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { set: mapSet(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_update_error');
+  }
+});
+
+app.delete('/api/admin/sets/:id', adminAuth, async (req, res) => {
+  try {
+    const current = await assertExists('sets', 'id', req.params.id, 'Set');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('sets')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    await refreshExamCounts([current.exam_id]);
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - QUESTIONS
+// =========================================================
+
+app.get('/api/admin/questions', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('questions')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    const examId = req.query.examId || req.query.exam_id;
+    const subjectId = req.query.subjectId || req.query.subject_id;
+    const topicId = req.query.topicId || req.query.topic_id;
+    const difficulty = req.query.difficulty;
+    const questionType = req.query.questionType || req.query.question_type;
+
+    if (examId) query = query.eq('exam_id', examId);
+    if (subjectId) query = query.eq('subject_id', subjectId);
+    if (topicId) query = query.eq('topic_id', topicId);
+    if (difficulty !== undefined) query = query.eq('difficulty', number(difficulty));
+    if (questionType) query = query.eq('question_type', questionType);
+
+    if (req.query.search) {
+      query = query.ilike('stem', `%${String(req.query.search)}%`);
+    }
+
+    const limit = Math.min(
+      Math.max(number(req.query.limit, 50), 1),
+      200
+    );
+    query = query.limit(limit);
+
+    const { data, error: dbError } = await query;
+    if (dbError) throw dbError;
+
+    return response(res, {
+      questions: (data || []).map(mapQuestionAdmin),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_questions_error', 500);
+  }
+});
+
+app.get('/api/admin/questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('questions')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (dbError) throw dbError;
+    if (!data) return error(res, 404, 'Question not found.', 'question_not_found');
+
+    return response(res, { question: mapQuestionAdmin(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_question_get_error', 500);
+  }
+});
+
+app.post('/api/admin/questions', adminAuth, async (req, res) => {
+  try {
+    const payload = questionPayload(req.body || {});
+
+    if (payload.exam_id) await assertExists('exams', 'id', payload.exam_id, 'Exam');
+    if (payload.subject_id) await assertExists('subjects', 'id', payload.subject_id, 'Subject');
+    if (payload.topic_id) await assertExists('taxonomy_nodes', 'id', payload.topic_id, 'Topic');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('questions')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    await refreshSubjectCounts([payload.subject_id]);
+    await refreshExamCounts([payload.exam_id]);
+
+    return response(res, {
+      question: mapQuestionAdmin(data),
+    }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_question_create_error');
+  }
+});
+
+app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
+  try {
+    const items = Array.isArray(req.body)
+      ? req.body
+      : (Array.isArray(req.body?.questions) ? req.body.questions : []);
+
+    if (!items.length) {
+      return error(res, 400, 'questions array is required.', 'questions_required');
+    }
+
+    if (items.length > 500) {
+      return error(res, 400, 'Maximum 500 questions per request.', 'bulk_limit');
+    }
+
+    const payloads = items.map(questionPayload);
+    const examIds = [...new Set(payloads.map((x) => x.exam_id).filter(Boolean))];
+    const subjectIds = [...new Set(payloads.map((x) => x.subject_id).filter(Boolean))];
+    const topicIds = [...new Set(payloads.map((x) => x.topic_id).filter(Boolean))];
+
+    for (const examId of examIds) await assertExists('exams', 'id', examId, 'Exam');
+    for (const subjectId of subjectIds) await assertExists('subjects', 'id', subjectId, 'Subject');
+    for (const topicId of topicIds) await assertExists('taxonomy_nodes', 'id', topicId, 'Topic');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('questions')
+      .insert(payloads)
+      .select('*');
+
+    if (dbError) throw dbError;
+
+    await refreshSubjectCounts(subjectIds);
+    await refreshExamCounts(examIds);
+
+    return response(res, {
+      count: data?.length || 0,
+      questions: (data || []).map(mapQuestionAdmin),
+    }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_questions_bulk_create_error');
+  }
+});
+
+app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: current, error: currentError } = await supabaseAdmin
+      .from('questions')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (currentError) throw currentError;
+    if (!current) return error(res, 404, 'Question not found.', 'question_not_found');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.questionId !== undefined || body.question_id !== undefined) {
+      update.question_id = requiredText(
+        bodyValue(body, 'questionId', 'question_id'),
+        'questionId'
+      );
+    }
+    if (body.stem !== undefined) update.stem = requiredText(body.stem, 'stem');
+    if (body.questionType !== undefined || body.question_type !== undefined) {
+      update.question_type = String(bodyValue(body, 'questionType', 'question_type'));
+    }
+    if (body.difficulty !== undefined) update.difficulty = nullableNumber(body.difficulty, 1);
+    if (body.sourceYear !== undefined || body.source_year !== undefined) {
+      update.source_year = nullableNumber(bodyValue(body, 'sourceYear', 'source_year'));
+    }
+    if (body.examName !== undefined || body.exam_name !== undefined) {
+      update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
+    }
+    if (body.examId !== undefined || body.exam_id !== undefined) {
+      const examId = optionalText(bodyValue(body, 'examId', 'exam_id'));
+      if (examId) await assertExists('exams', 'id', examId, 'Exam');
+      update.exam_id = examId;
+    }
+    if (body.subjectId !== undefined || body.subject_id !== undefined) {
+      const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
+      if (subjectId) await assertExists('subjects', 'id', subjectId, 'Subject');
+      update.subject_id = subjectId;
+    }
+    if (body.topicId !== undefined || body.topic_id !== undefined) {
+      const topicId = optionalText(bodyValue(body, 'topicId', 'topic_id'));
+      if (topicId) await assertExists('taxonomy_nodes', 'id', topicId, 'Topic');
+      update.topic_id = topicId;
+    }
+    if (body.options !== undefined) update.options = body.options;
+    if (body.correctOption !== undefined || body.correct_option !== undefined) {
+      update.correct_option = optionalText(
+        bodyValue(body, 'correctOption', 'correct_option')
+      );
+    }
+    if (body.explanation !== undefined) update.explanation = optionalText(body.explanation);
+    if (body.imageUrl !== undefined || body.image_url !== undefined) {
+      update.image_url = optionalText(bodyValue(body, 'imageUrl', 'image_url'));
+    }
+    if (body.hasImage !== undefined || body.has_image !== undefined) {
+      update.has_image = Boolean(bodyValue(body, 'hasImage', 'has_image'));
+    }
+
+    ensureNonEmptyUpdate(update);
+
+    const nextQuestionType = update.question_type || current.question_type;
+    const nextCorrectOption =
+      update.correct_option !== undefined
+        ? update.correct_option
+        : current.correct_option;
+
+    if (
+      String(nextQuestionType).toUpperCase() === 'MCQ' &&
+      !nextCorrectOption
+    ) {
+      return error(
+        res,
+        400,
+        'correctOption is required for MCQ questions.',
+        'missing_correct_option'
+      );
+    }
+
+    const nextOptions =
+      update.options !== undefined ? update.options : current.options;
+
+    if (String(nextQuestionType).toUpperCase() === 'MCQ') {
+      const invalidOptions =
+        nextOptions === null ||
+        typeof nextOptions !== 'object' ||
+        (Array.isArray(nextOptions) && nextOptions.length === 0) ||
+        (!Array.isArray(nextOptions) &&
+          Object.keys(nextOptions).length === 0);
+
+      if (invalidOptions) {
+        return error(
+          res,
+          400,
+          'options must be a non-empty JSON object/array for MCQ questions.',
+          'invalid_options'
+        );
+      }
+    }
+
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('questions')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    await refreshSubjectCounts([current.subject_id, data.subject_id]);
+    await refreshExamCounts([current.exam_id, data.exam_id]);
+
+    return response(res, { question: mapQuestionAdmin(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_question_update_error');
+  }
+});
+
+app.delete('/api/admin/questions/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: current, error: currentError } = await supabaseAdmin
+      .from('questions')
+      .select('id,exam_id,subject_id')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (currentError) throw currentError;
+    if (!current) return error(res, 404, 'Question not found.', 'question_not_found');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('questions')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    await refreshSubjectCounts([current.subject_id]);
+    await refreshExamCounts([current.exam_id]);
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_question_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - SET QUESTIONS
+// =========================================================
+
+app.get('/api/admin/sets/:setId/questions', adminAuth, async (req, res) => {
+  try {
+    await assertExists('sets', 'id', req.params.setId, 'Set');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('set_questions')
+      .select(`
+        set_id,
+        question_id,
+        position,
+        question:questions(*)
+      `)
+      .eq('set_id', req.params.setId)
+      .order('position', { ascending: true });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      questions: (data || []).map((row) => ({
+        setId: row.set_id,
+        questionId: row.question_id,
+        position: row.position,
+        question: row.question ? mapQuestionAdmin(row.question) : null,
+      })),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_questions_error', 500);
+  }
+});
+
+app.post('/api/admin/sets/:setId/questions', adminAuth, async (req, res) => {
+  try {
+    await assertExists('sets', 'id', req.params.setId, 'Set');
+
+    const body = req.body || {};
+    const questionId = requiredText(
+      bodyValue(body, 'questionId', 'question_id'),
+      'questionId'
+    );
+
+    await assertExists('questions', 'id', questionId, 'Question');
+
+    let position = positiveInt(
+      bodyValue(body, 'position'),
+      0
+    );
+
+    if (!position) {
+      const { data: last, error: lastError } = await supabaseAdmin
+        .from('set_questions')
+        .select('position')
+        .eq('set_id', req.params.setId)
+        .order('position', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (lastError) throw lastError;
+      position = Number(last?.position || 0) + 1;
+    }
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('set_questions')
+      .upsert(
+        {
+          set_id: req.params.setId,
+          question_id: questionId,
+          position,
+        },
+        { onConflict: 'set_id,question_id' }
+      )
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    await refreshSetCount(req.params.setId);
+
+    return response(res, { setQuestion: data });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_question_add_error');
+  }
+});
+
+app.post('/api/admin/sets/:setId/questions/bulk', adminAuth, async (req, res) => {
+  try {
+    await assertExists('sets', 'id', req.params.setId, 'Set');
+
+    const items = Array.isArray(req.body)
+      ? req.body
+      : (Array.isArray(req.body?.questions) ? req.body.questions : []);
+
+    if (!items.length) {
+      return error(res, 400, 'questions array is required.', 'questions_required');
+    }
+
+    const questionIds = items.map((item) =>
+      requiredText(
+        bodyValue(item, 'questionId', 'question_id'),
+        'questionId'
+      )
+    );
+
+    const positions = items.map((item, index) =>
+      positiveInt(bodyValue(item, 'position'), index + 1)
+    );
+
+    if (new Set(questionIds).size !== questionIds.length) {
+      return error(res, 400, 'Duplicate questionId values are not allowed.', 'duplicate_questions');
+    }
+
+    if (new Set(positions).size !== positions.length) {
+      return error(res, 400, 'Duplicate positions are not allowed.', 'duplicate_positions');
+    }
+
+    const { data: questions, error: questionError } = await supabaseAdmin
+      .from('questions')
+      .select('id')
+      .in('id', questionIds);
+
+    if (questionError) throw questionError;
+
+    const found = new Set((questions || []).map((q) => q.id));
+    const missing = questionIds.filter((id) => !found.has(id));
+    if (missing.length) {
+      const err = new Error(`Question(s) not found: ${missing.join(', ')}`);
+      err.status = 404;
+      err.code = 'questions_not_found';
+      throw err;
+    }
+
+    const rows = questionIds.map((questionId, index) => ({
+      set_id: req.params.setId,
+      question_id: questionId,
+      position: positions[index],
+    }));
+
+    const { data, error: dbError } = await supabaseAdmin
+      .upsert(
+        rows,
+        { onConflict: 'set_id,question_id' }
+      )
+      .select('*');
+
+    if (dbError) throw dbError;
+
+    await refreshSetCount(req.params.setId);
+
+    return response(res, {
+      count: data?.length || 0,
+      setQuestions: data || [],
+    }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_questions_bulk_error');
+  }
+});
+
+app.put('/api/admin/sets/:setId/questions', adminAuth, async (req, res) => {
+  try {
+    await assertExists('sets', 'id', req.params.setId, 'Set');
+
+    const body = req.body || {};
+    const questionIds = Array.isArray(body)
+      ? body
+      : (Array.isArray(body.questionIds)
+          ? body.questionIds
+          : (Array.isArray(body.questions)
+              ? body.questions.map((x) => bodyValue(x, 'questionId', 'question_id'))
+              : []));
+
+    const rows = await replaceSetQuestions(req.params.setId, questionIds);
+    await refreshSetCount(req.params.setId);
+
+    return response(res, {
+      count: rows.length,
+      setQuestions: rows,
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_questions_replace_error');
+  }
+});
+
+app.delete('/api/admin/sets/:setId/questions/:questionId', adminAuth, async (req, res) => {
+  try {
+    await assertExists('sets', 'id', req.params.setId, 'Set');
+    await assertExists('questions', 'id', req.params.questionId, 'Question');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('set_questions')
+      .delete()
+      .eq('set_id', req.params.setId)
+      .eq('question_id', req.params.questionId);
+
+    if (dbError) throw dbError;
+
+    await refreshSetCount(req.params.setId);
+
+    return response(res, {
+      deleted: true,
+      setId: req.params.setId,
+      questionId: req.params.questionId,
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_set_question_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - APP CONFIG
+// =========================================================
+
+app.get('/api/admin/app-config', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .select('*')
+      .order('key', { ascending: true });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      config: data || [],
+      resolved: Object.fromEntries(
+        (data || []).map((row) => [row.key, row.value])
+      ),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_config_error', 500);
+  }
+});
+
+app.put('/api/admin/app-config/:key', adminAuth, async (req, res) => {
+  try {
+    const key = requiredText(req.params.key, 'key');
+    const { value } = req.body || {};
+
+    if (value === undefined) {
+      return error(res, 400, 'value is required.', 'value_required');
+    }
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .upsert(
+        {
+          key,
+          value,
+          updated_at: now(),
+        },
+        { onConflict: 'key' }
+      )
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { config: data });
+  } catch (e) {
+    return adminFail(res, e, 'admin_config_update_error');
+  }
+});
+
+app.delete('/api/admin/app-config/:key', adminAuth, async (req, res) => {
+  try {
+    const key = requiredText(req.params.key, 'key');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .delete()
+      .eq('key', key);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, key });
+  } catch (e) {
+    return adminFail(res, e, 'admin_config_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - BANNERS
+// =========================================================
+
+app.get('/api/admin/banners', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('banners')
+      .select('*')
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: false });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      banners: (data || []).map(mapBanner),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_banners_error', 500);
+  }
+});
+
+app.post('/api/admin/banners', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const title = requiredText(bodyValue(body, 'title'), 'title');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('banners')
+      .insert({
+        id,
+        title,
+        subtitle: optionalText(bodyValue(body, 'subtitle')),
+        image_url: optionalText(bodyValue(body, 'imageUrl', 'image_url')),
+        is_active: Boolean(bodyValue(body, 'isActive', 'is_active', true)),
+        sort_order: number(bodyValue(body, 'sortOrder', 'sort_order', 0)),
+      })
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { banner: mapBanner(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_banner_create_error');
+  }
+});
+
+app.patch('/api/admin/banners/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('banners', 'id', req.params.id, 'Banner');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.title !== undefined) update.title = requiredText(body.title, 'title');
+    if (body.subtitle !== undefined) update.subtitle = optionalText(body.subtitle);
+    if (body.imageUrl !== undefined || body.image_url !== undefined) {
+      update.image_url = optionalText(bodyValue(body, 'imageUrl', 'image_url'));
+    }
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      update.is_active = Boolean(bodyValue(body, 'isActive', 'is_active'));
+    }
+    if (body.sortOrder !== undefined || body.sort_order !== undefined) {
+      update.sort_order = number(bodyValue(body, 'sortOrder', 'sort_order', 0));
+    }
+
+    ensureNonEmptyUpdate(update);
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('banners')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { banner: mapBanner(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_banner_update_error');
+  }
+});
+
+app.delete('/api/admin/banners/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('banners', 'id', req.params.id, 'Banner');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('banners')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_banner_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - SUBSCRIPTION PLANS
+// =========================================================
+
+app.get('/api/admin/subscription-plans', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('subscription_plans')
+      .select('*')
+      .order('price', { ascending: true });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      plans: (data || []).map(mapPlan),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_plans_error', 500);
+  }
+});
+
+app.post('/api/admin/subscription-plans', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const name = requiredText(bodyValue(body, 'name'), 'name');
+    const price = nullableNumber(bodyValue(body, 'price'), 0);
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('subscription_plans')
+      .insert({
+        id,
+        name,
+        description: optionalText(bodyValue(body, 'description')),
+        duration_days: positiveInt(
+          bodyValue(body, 'durationDays', 'duration_days', 30),
+          30
+        ),
+        price,
+        mrp: nullableNumber(bodyValue(body, 'mrp')),
+        currency: String(bodyValue(body, 'currency', 'currency', 'INR')),
+        is_active: Boolean(bodyValue(body, 'isActive', 'is_active', true)),
+      })
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { plan: mapPlan(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_plan_create_error');
+  }
+});
+
+app.patch('/api/admin/subscription-plans/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('subscription_plans', 'id', req.params.id, 'Subscription plan');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name !== undefined) update.name = requiredText(body.name, 'name');
+    if (body.description !== undefined) update.description = optionalText(body.description);
+    if (body.durationDays !== undefined || body.duration_days !== undefined) {
+      update.duration_days = positiveInt(
+        bodyValue(body, 'durationDays', 'duration_days', 30),
+        30
+      );
+    }
+    if (body.price !== undefined) update.price = nullableNumber(body.price, 0);
+    if (body.mrp !== undefined) update.mrp = nullableNumber(body.mrp);
+    if (body.currency !== undefined) update.currency = String(body.currency);
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      update.is_active = Boolean(bodyValue(body, 'isActive', 'is_active'));
+    }
+
+    ensureNonEmptyUpdate(update);
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('subscription_plans')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { plan: mapPlan(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_plan_update_error');
+  }
+});
+
+app.delete('/api/admin/subscription-plans/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('subscription_plans', 'id', req.params.id, 'Subscription plan');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('subscription_plans')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_plan_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - MARKET PRODUCTS
+// =========================================================
+
+app.get('/api/admin/market-products', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('market_products')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      products: (data || []).map(mapProduct),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_products_error', 500);
+  }
+});
+
+app.post('/api/admin/market-products', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const title = requiredText(bodyValue(body, 'title'), 'title');
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('market_products')
+      .insert({
+        id,
+        title,
+        description: optionalText(bodyValue(body, 'description')),
+        category: optionalText(bodyValue(body, 'category')),
+        type: optionalText(bodyValue(body, 'type')),
+        price: nullableNumber(bodyValue(body, 'price')),
+        sale_price: nullableNumber(bodyValue(body, 'salePrice', 'sale_price')),
+        mrp: nullableNumber(bodyValue(body, 'mrp')),
+        currency: String(bodyValue(body, 'currency', 'currency', 'INR')),
+        stock: nullableNumber(bodyValue(body, 'stock')),
+        is_active: Boolean(bodyValue(body, 'isActive', 'is_active', true)),
+        featured: Boolean(bodyValue(body, 'featured', 'featured', false)),
+        image_url: optionalText(bodyValue(body, 'imageUrl', 'image_url')),
+      })
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { product: mapProduct(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_product_create_error');
+  }
+});
+
+app.patch('/api/admin/market-products/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('market_products', 'id', req.params.id, 'Market product');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.title !== undefined) update.title = requiredText(body.title, 'title');
+    if (body.description !== undefined) update.description = optionalText(body.description);
+    if (body.category !== undefined) update.category = optionalText(body.category);
+    if (body.type !== undefined) update.type = optionalText(body.type);
+    if (body.price !== undefined) update.price = nullableNumber(body.price);
+    if (body.salePrice !== undefined || body.sale_price !== undefined) {
+      update.sale_price = nullableNumber(bodyValue(body, 'salePrice', 'sale_price'));
+    }
+    if (body.mrp !== undefined) update.mrp = nullableNumber(body.mrp);
+    if (body.currency !== undefined) update.currency = String(body.currency);
+    if (body.stock !== undefined) update.stock = nullableNumber(body.stock);
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      update.is_active = Boolean(bodyValue(body, 'isActive', 'is_active'));
+    }
+    if (body.featured !== undefined) update.featured = Boolean(body.featured);
+    if (body.imageUrl !== undefined || body.image_url !== undefined) {
+      update.image_url = optionalText(bodyValue(body, 'imageUrl', 'image_url'));
+    }
+
+    ensureNonEmptyUpdate(update);
+    update.updated_at = now();
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('market_products')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { product: mapProduct(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_product_update_error');
+  }
+});
+
+app.delete('/api/admin/market-products/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('market_products', 'id', req.params.id, 'Market product');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('market_products')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_product_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - MODE RULES
+// =========================================================
+
+app.get('/api/admin/mode-rules', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('mode_rules')
+      .select('*')
+      .order('mode', { ascending: true });
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      rules: (data || []).map(mapModeRule),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_mode_rules_error', 500);
+  }
+});
+
+app.post('/api/admin/mode-rules', adminAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = requiredText(bodyValue(body, 'id'), 'id');
+    const mode = requiredText(bodyValue(body, 'mode'), 'mode');
+    const source = String(bodyValue(body, 'source', 'source', 'supabase'));
+
+    const minQuestions = positiveInt(
+      bodyValue(body, 'minQuestions', 'min_questions', 1),
+      1
+    );
+    const maxQuestions = positiveInt(
+      bodyValue(body, 'maxQuestions', 'max_questions', 30),
+      30
+    );
+
+    if (maxQuestions < minQuestions) {
+      return error(res, 400, 'maxQuestions must be >= minQuestions.', 'invalid_question_range');
+    }
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('mode_rules')
+      .insert({
+        id,
+        source,
+        mode,
+        min_questions: minQuestions,
+        max_questions: maxQuestions,
+        timer_type: String(bodyValue(body, 'timerType', 'timer_type', 'none')),
+        allow_resume: Boolean(bodyValue(body, 'allowResume', 'allow_resume', true)),
+        allow_skip: Boolean(bodyValue(body, 'allowSkip', 'allow_skip', true)),
+        allow_instant_feedback: Boolean(
+          bodyValue(body, 'allowInstantFeedback', 'allow_instant_feedback', true)
+        ),
+        allow_explanation: Boolean(
+          bodyValue(body, 'allowExplanation', 'allow_explanation', true)
+        ),
+      })
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { rule: mapModeRule(data) }, 201);
+  } catch (e) {
+    return adminFail(res, e, 'admin_mode_rule_create_error');
+  }
+});
+
+app.patch('/api/admin/mode-rules/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('mode_rules', 'id', req.params.id, 'Mode rule');
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.source !== undefined) update.source = String(body.source);
+    if (body.mode !== undefined) update.mode = requiredText(body.mode, 'mode');
+
+    if (body.minQuestions !== undefined || body.min_questions !== undefined) {
+      update.min_questions = positiveInt(
+        bodyValue(body, 'minQuestions', 'min_questions', 1),
+        1
+      );
+    }
+
+    if (body.maxQuestions !== undefined || body.max_questions !== undefined) {
+      update.max_questions = positiveInt(
+        bodyValue(body, 'maxQuestions', 'max_questions', 30),
+        30
+      );
+    }
+
+    if (update.max_questions !== undefined &&
+        update.min_questions !== undefined &&
+        update.max_questions < update.min_questions) {
+      return error(res, 400, 'maxQuestions must be >= minQuestions.', 'invalid_question_range');
+    }
+
+    if (body.timerType !== undefined || body.timer_type !== undefined) {
+      update.timer_type = String(bodyValue(body, 'timerType', 'timer_type'));
+    }
+    if (body.allowResume !== undefined || body.allow_resume !== undefined) {
+      update.allow_resume = Boolean(bodyValue(body, 'allowResume', 'allow_resume'));
+    }
+    if (body.allowSkip !== undefined || body.allow_skip !== undefined) {
+      update.allow_skip = Boolean(bodyValue(body, 'allowSkip', 'allow_skip'));
+    }
+    if (body.allowInstantFeedback !== undefined || body.allow_instant_feedback !== undefined) {
+      update.allow_instant_feedback = Boolean(
+        bodyValue(body, 'allowInstantFeedback', 'allow_instant_feedback')
+      );
+    }
+    if (body.allowExplanation !== undefined || body.allow_explanation !== undefined) {
+      update.allow_explanation = Boolean(
+        bodyValue(body, 'allowExplanation', 'allow_explanation')
+      );
+    }
+
+    ensureNonEmptyUpdate(update);
+
+    const { data, error: dbError } = await supabaseAdmin
+      .from('mode_rules')
+      .update(update)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (dbError) throw dbError;
+
+    return response(res, { rule: mapModeRule(data) });
+  } catch (e) {
+    return adminFail(res, e, 'admin_mode_rule_update_error');
+  }
+});
+
+app.delete('/api/admin/mode-rules/:id', adminAuth, async (req, res) => {
+  try {
+    await assertExists('mode_rules', 'id', req.params.id, 'Mode rule');
+
+    const { error: dbError } = await supabaseAdmin
+      .from('mode_rules')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (dbError) throw dbError;
+
+    return response(res, { deleted: true, id: req.params.id });
+  } catch (e) {
+    return adminFail(res, e, 'admin_mode_rule_delete_error');
+  }
+});
+
+// =========================================================
+// ADMIN - ORDERS (READ ONLY)
+// =========================================================
+
+app.get('/api/admin/orders', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('order_intents')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (req.query.status) query = query.eq('status', String(req.query.status));
+    if (req.query.userId || req.query.user_id) {
+      query = query.eq('user_id', String(req.query.userId || req.query.user_id));
+    }
+
+    const limit = Math.min(Math.max(number(req.query.limit, 100), 1), 200);
+    const { data, error: dbError } = await query.limit(limit);
+    if (dbError) throw dbError;
+
+    return response(res, {
+      orders: (data || []).map((row) => ({
+        id: row.id,
+        userId: row.user_id,
+        status: row.status,
+        items: row.items || [],
+        paymentUrl: row.payment_url,
+        createdAt: row.created_at,
+      })),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_orders_error', 500);
+  }
+});
+
+app.get('/api/admin/orders/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: row, error: dbError } = await supabaseAdmin
+      .from('order_intents')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (dbError) throw dbError;
+    if (!row) return error(res, 404, 'Order not found.', 'order_not_found');
+
+    return response(res, {
+      order: {
+        id: row.id,
+        userId: row.user_id,
+        status: row.status,
+        items: row.items || [],
+        paymentUrl: row.payment_url,
+        createdAt: row.created_at,
+      },
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_order_get_error', 500);
+  }
+});
+
+// =========================================================
+// ADMIN - USERS / SUBSCRIPTIONS (READ ONLY)
+// =========================================================
+
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    let query = supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (req.query.search) {
+      const search = String(req.query.search);
+      query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
+    }
+
+    const limit = Math.min(
+      Math.max(number(req.query.limit, 50), 1),
+      200
+    );
+
+    const { data, error: dbError } = await query.limit(limit);
+    if (dbError) throw dbError;
+
+    return response(res, {
+      users: (data || []).map((row) => ({
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        avatarUrl: row.avatar_url,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_users_error', 500);
+  }
+});
+
+app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (profileError) throw profileError;
+    if (!profile) return error(res, 404, 'User not found.', 'user_not_found');
+
+    const { data: subscriptions, error: subError } = await supabaseAdmin
+      .from('user_subscriptions')
+      .select(`
+        *,
+        plan:subscription_plans(*)
+      `)
+      .eq('user_id', req.params.id)
+      .order('created_at', { ascending: false });
+
+    if (subError) throw subError;
+
+    return response(res, {
+      user: {
+        id: profile.id,
+        name: profile.name,
+        email: profile.email,
+        avatarUrl: profile.avatar_url,
+        createdAt: profile.created_at,
+        updatedAt: profile.updated_at,
+      },
+      subscriptions: (subscriptions || []).map((row) => ({
+        id: row.id,
+        planId: row.plan_id,
+        planName: row.plan?.name || null,
+        status: row.status,
+        startedAt: row.started_at,
+        expiresAt: row.expires_at,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_user_get_error', 500);
+  }
+});
+
+// =========================================================
+// ADMIN - HEALTH
+// =========================================================
+
+app.get('/api/admin/health', adminAuth, async (req, res) => {
+  try {
+    const { data, error: dbError } = await supabaseAdmin
+      .from('app_config')
+      .select('key')
+      .limit(1);
+
+    if (dbError) throw dbError;
+
+    return response(res, {
+      ok: true,
+      database: 'supabase',
+      checkedAt: now(),
+      configRowsReadable: Array.isArray(data),
+    });
+  } catch (e) {
+    return adminFail(res, e, 'admin_health_error', 500);
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| DEBUG WORKFLOW
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  '/api/debug/workflow',
+  auth,
+  async (req, res) => {
+    try {
+      const userId =
+        req.user.id;
+
+      const [
+        summary,
+        revisionResult,
+        bookmarksResult,
+        marksResult,
+        wrongResult,
+        weakResult,
+        sessionsResult,
+      ] = await Promise.all([
+        revisionSummary(userId),
+
+        supabaseAdmin
+          .from('revision_questions')
+          .select(
+            'question_id,source,created_at'
+          )
+          .eq(
+            'user_id',
+            userId
+          ),
+
+        supabaseAdmin
+          .from('bookmarks')
+          .select(
+            'question_id,created_at'
+          )
+          .eq(
+            'user_id',
+            userId
+          ),
+
+        supabaseAdmin
+          .from('revision_marks')
+          .select(
+            'question_id,marked'
+          )
+          .eq(
+            'user_id',
+            userId
+          ),
+
+        supabaseAdmin
+          .from('wrong_questions')
+          .select(
+            'question_id,attempt_count,last_wrong_at'
+          )
+          .eq(
+            'user_id',
+            userId
+          ),
+
+        supabaseAdmin
+          .from('weak_topics')
+          .select('*')
+          .eq(
+            'user_id',
+            userId
+          ),
+
+        supabaseAdmin
+          .from('sessions')
+          .select('*')
+          .eq(
+            'user_id',
+            userId
+          )
+          .order('created_at', {
+            ascending: false,
+          }),
+      ]);
+
+      const results = [
+        revisionResult,
+        bookmarksResult,
+        marksResult,
+        wrongResult,
+        weakResult,
+        sessionsResult,
+      ];
+
+      for (const result of results) {
+        if (result.error) {
+          throw result.error;
+        }
+      }
+
+      return response(res, {
+        summary,
+
+        revision:
+          revisionResult.data || [],
+
+        bookmarks:
+          bookmarksResult.data || [],
+
+        flagged:
+          marksResult.data || [],
+
+        wrong:
+          wrongResult.data || [],
+
+        weakTopics:
+          weakResult.data || [],
+
+        sessions:
+          (sessionsResult.data || [])
+            .map(historyFromSession),
+      });
+    } catch (e) {
+      return error(
+        res,
+        500,
+        e.message,
+        'debug_error'
+      );
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| 404
+|--------------------------------------------------------------------------
+*/
+
+app.use((req, res) =>
+  error(
+    res,
+    404,
+    `Route not found: ${req.method} ${req.originalUrl}`,
+    'not_found'
+  )
+);
+
+/*
+|--------------------------------------------------------------------------
+| Error Handler
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+  (err, req, res, next) => {
+    console.error(err);
+
+    return error(
+      res,
+      500,
+      process.env.NODE_ENV === 'production'
+        ? 'Internal server error.'
+        : err.message,
+      'internal_error'
+    );
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| Server
+|--------------------------------------------------------------------------
+*/
+
+const server = app.listen(
+  PORT,
+  HOST,
+  () => {
+    console.log(
+      `PYQ Pulse Express API running on http://${HOST}:${PORT}`
+    );
+
+    console.log(
+      `Health: http://localhost:${PORT}/health`
+    );
+
+    console.log(
+      'Storage: Supabase PostgreSQL'
+    );
+
+    console.log(
+      'Authentication: Supabase Auth'
+    );
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| Graceful Shutdown
+|--------------------------------------------------------------------------
+*/
+
+function shutdown(signal) {
+  console.log(
+    `${signal}: shutting down...`
+  );
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(
+    () => process.exit(1),
+    5000
+  ).unref();
+}
+
+process.on(
+  'SIGINT',
+  () => shutdown('SIGINT')
+);
+
+process.on(
+  'SIGTERM',
+  () => shutdown('SIGTERM')
+);
