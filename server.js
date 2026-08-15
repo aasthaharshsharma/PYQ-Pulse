@@ -89,6 +89,9 @@ const supabaseAdmin = createClient(
   }
 );
 
+const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || 'pyq-pulse-media';
+let mediaBucketReady = null;
+
 /*
 |--------------------------------------------------------------------------
 | Express
@@ -147,6 +150,361 @@ function number(value, fallback = 0) {
 
 function bool(value) {
   return value === true;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Supabase Media Storage
+|--------------------------------------------------------------------------
+*/
+
+async function ensureMediaBucket() {
+  if (!mediaBucketReady) {
+    mediaBucketReady = (async () => {
+      const { data: buckets, error: listError } = await supabaseAdmin.storage.listBuckets();
+      if (listError) throw listError;
+      const existing = (buckets || []).find((b) => b.name === MEDIA_BUCKET);
+      if (existing) return;
+      const { error: createError } = await supabaseAdmin.storage.createBucket(MEDIA_BUCKET, {
+        public: true,
+        fileSizeLimit: '10MB',
+      });
+      if (createError && !/already exists/i.test(String(createError.message || ''))) throw createError;
+    })().catch((e) => { mediaBucketReady = null; throw e; });
+  }
+  return mediaBucketReady;
+}
+
+function parseMultipart(req, maxBytes = 10 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const contentType = String(req.headers['content-type'] || '');
+
+    const match = contentType.match(
+      /boundary=(?:"([^"]+)"|([^;]+))/i
+    );
+
+    if (!match) {
+      return reject(
+        Object.assign(
+          new Error('Invalid multipart request.'),
+          { status: 400 }
+        )
+      );
+    }
+
+    const boundaryValue = match[1] || match[2];
+    const boundary = Buffer.from(`--${boundaryValue}`);
+
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    req.on('data', (chunk) => {
+      if (settled) return;
+
+      size += chunk.length;
+
+      if (size > maxBytes) {
+        return fail(
+          Object.assign(
+            new Error('Image is too large. Maximum size is 10MB.'),
+            { status: 413 }
+          )
+        );
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on('error', fail);
+
+    req.on('end', () => {
+      if (settled) return;
+
+      try {
+        const buffer = Buffer.concat(chunks);
+        const parts = [];
+
+        let cursor = 0;
+
+        while (true) {
+          const start = buffer.indexOf(boundary, cursor);
+
+          if (start < 0) break;
+
+          const next = buffer.indexOf(
+            boundary,
+            start + boundary.length
+          );
+
+          if (next < 0) break;
+
+          let part = buffer.slice(
+            start + boundary.length,
+            next
+          );
+
+          // Remove CRLF before part
+          if (
+            part.length >= 2 &&
+            part.subarray(0, 2).equals(
+              Buffer.from('\r\n')
+            )
+          ) {
+            part = part.subarray(2);
+          }
+
+          // Remove CRLF after content
+          if (
+            part.length >= 2 &&
+            part.subarray(-2).equals(
+              Buffer.from('\r\n')
+            )
+          ) {
+            part = part.subarray(0, -2);
+          }
+
+          // Ignore terminating boundary
+          if (
+            part.length >= 2 &&
+            part.subarray(0, 2).equals(
+              Buffer.from('--')
+            )
+          ) {
+            break;
+          }
+
+          const separator = Buffer.from(
+            '\r\n\r\n'
+          );
+
+          const split = part.indexOf(separator);
+
+          if (split < 0) {
+            cursor = next;
+            continue;
+          }
+
+          const headerText = part
+            .slice(0, split)
+            .toString('utf8');
+
+          const content = part.slice(
+            split + separator.length
+          );
+
+          const dispositionMatch =
+            headerText.match(
+              /Content-Disposition:\s*form-data;\s*([^\r\n]+)/i
+            );
+
+          const disposition =
+            dispositionMatch?.[1] || '';
+
+          const nameMatch =
+            disposition.match(
+              /name="([^"]+)"/i
+            );
+
+          const filenameMatch =
+            disposition.match(
+              /filename="([^"]*)"/i
+            );
+
+          const name =
+            nameMatch?.[1] || '';
+
+          const filename =
+            filenameMatch?.[1] || '';
+
+          const typeMatch =
+            headerText.match(
+              /Content-Type:\s*([^\r\n]+)/i
+            );
+
+          const type =
+            typeMatch?.[1]?.trim() ||
+            'application/octet-stream';
+
+          if (name) {
+            parts.push({
+              name,
+              filename,
+              type,
+              data: content,
+            });
+          }
+
+          cursor = next;
+        }
+
+        settled = true;
+        resolve(parts);
+      } catch (e) {
+        fail(e);
+      }
+    });
+  });
+}
+
+function safeFileExtension(filename, contentType) {
+  const ext = String(filename || '')
+    .split('.')
+    .pop()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+  if (ext && ext.length <= 8) {
+    return ext;
+  }
+
+  const byType = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/svg+xml': 'svg',
+    'image/avif': 'avif',
+    'image/bmp': 'bmp',
+    'image/x-icon': 'ico',
+  };
+
+  return byType[
+    String(contentType || '').toLowerCase()
+  ] || 'jpg';
+}
+
+async function uploadAdminImage(req, res) {
+  try {
+    await ensureMediaBucket();
+
+    const parts = await parseMultipart(req);
+
+    /*
+     * Accept all normal admin image field names.
+     * This makes the endpoint compatible with:
+     * file / image / logo / banner
+     */
+    const imageFieldNames = new Set([
+      'file',
+      'image',
+      'logo',
+      'banner',
+    ]);
+
+    const file = parts.find(
+      (p) =>
+        imageFieldNames.has(
+          String(p.name || '').toLowerCase()
+        ) &&
+        p.data &&
+        p.data.length > 0
+    );
+
+    const folderPart = parts.find(
+      (p) =>
+        String(p.name || '').toLowerCase() ===
+        'folder'
+    );
+
+    const folder =
+      (
+        folderPart?.data
+          ?.toString('utf8')
+          .trim() || 'general'
+      )
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '-')
+        .slice(0, 40) || 'general';
+
+    if (!file) {
+      return error(
+        res,
+        400,
+        'Image file is required.',
+        'image_required'
+      );
+    }
+
+    const contentType = String(
+      file.type || ''
+    ).toLowerCase();
+
+    if (!contentType.startsWith('image/')) {
+      return error(
+        res,
+        400,
+        'Only image files are allowed.',
+        'invalid_image_type'
+      );
+    }
+
+    /*
+     * Some FormData implementations may not provide
+     * filename correctly. Extension will therefore
+     * safely fall back to Content-Type.
+     */
+    const extension = safeFileExtension(
+      file.filename,
+      contentType
+    );
+
+    const objectPath =
+      `${folder}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+
+    const {
+      error: uploadError,
+    } = await supabaseAdmin.storage
+      .from(MEDIA_BUCKET)
+      .upload(
+        objectPath,
+        file.data,
+        {
+          contentType,
+          upsert: false,
+          cacheControl: '31536000',
+        }
+      );
+
+    if (uploadError) {
+      throw uploadError;
+    }
+
+    const {
+      data: publicUrlData,
+    } =
+      supabaseAdmin.storage
+        .from(MEDIA_BUCKET)
+        .getPublicUrl(objectPath);
+
+    return response(
+      res,
+      {
+        url: publicUrlData.publicUrl,
+        path: objectPath,
+        bucket: MEDIA_BUCKET,
+      },
+      201
+    );
+  } catch (e) {
+    console.error(
+      '[ADMIN MEDIA UPLOAD ERROR]',
+      e
+    );
+
+    return adminFail(
+      res,
+      e,
+      'admin_image_upload_error'
+    );
+  }
 }
 
 /*
@@ -1746,6 +2104,8 @@ app.get(
           totalQuestionsAvailable:
             row.total_questions_available,
           freeSets: row.free_sets,
+          iconUrl: row.icon_url || null,
+          bannerUrl: row.banner_url || null,
         })
       );
 
@@ -1893,8 +2253,14 @@ app.get(
 
           isActive: row.is_active,
           featured: row.featured,
-
-          imageUrl: row.image_url,
+          isFeatured: Boolean(row.featured),
+          inStock: row.stock === null || Number(row.stock || 0) > 0,
+          requiresShipping: String(row.type || '').toUpperCase() !== 'DIGITAL',
+          hasOffer: row.sale_price !== null && row.price !== null && Number(row.sale_price) < Number(row.price),
+          discountPercent: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100)) : null,
+          offerLabel: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? `${Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100))}% OFF` : null,
+          imageUrl: row.image_url || null,
+          imageUrls: row.image_url ? [row.image_url] : [],
         })
       );
 
@@ -3452,6 +3818,32 @@ app.post(
 */
 
 // =========================================================
+// ADMIN - FORM OPTIONS
+// =========================================================
+
+app.get('/api/admin/form-options', adminAuth, async (req, res) => {
+  try {
+    const [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult] = await Promise.all([
+      supabaseAdmin.from('exams').select('id,name,code').eq('is_active', true).order('display_order', { ascending: true }),
+      supabaseAdmin.from('subjects').select('id,name,exam_id').order('display_order', { ascending: true }).order('name', { ascending: true }),
+      supabaseAdmin.from('taxonomy_nodes').select('id,name,node_type,subject_id,exam_id,parent_id').order('display_order', { ascending: true }).order('name', { ascending: true }),
+      supabaseAdmin.from('sets').select('id,name,exam_id,subject_id,year,set_type,is_published').order('created_at', { ascending: false }).limit(500),
+      supabaseAdmin.from('questions').select('id,question_id,stem,exam_id,subject_id,topic_id').order('created_at', { ascending: false }).limit(1000),
+    ]);
+    for (const r of [examsResult, subjectsResult, taxonomyResult, setsResult, questionsResult]) if (r.error) throw r.error;
+    return response(res, { exams: examsResult.data || [], subjects: subjectsResult.data || [], taxonomy: taxonomyResult.data || [], sets: setsResult.data || [], questions: questionsResult.data || [] });
+  } catch (e) {
+    return adminFail(res, e, 'admin_form_options_error', 500);
+  }
+});
+
+// =========================================================
+// ADMIN - MEDIA UPLOAD
+// =========================================================
+
+app.post('/api/admin/media/upload', adminAuth, uploadAdminImage);
+
+// =========================================================
 // ADMIN HELPERS
 // =========================================================
 
@@ -3543,6 +3935,8 @@ function mapExam(row) {
     totalSets: Number(row.total_sets || 0),
     totalQuestionsAvailable: Number(row.total_questions_available || 0),
     freeSets: Number(row.free_sets || 0),
+    iconUrl: row.icon_url || null,
+    bannerUrl: row.banner_url || null,
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
@@ -3657,7 +4051,14 @@ function mapProduct(row) {
     stock: row.stock,
     isActive: Boolean(row.is_active),
     featured: Boolean(row.featured),
-    imageUrl: row.image_url,
+    isFeatured: Boolean(row.featured),
+    inStock: row.stock === null || Number(row.stock || 0) > 0,
+    requiresShipping: String(row.type || '').toUpperCase() !== 'DIGITAL',
+    hasOffer: row.sale_price !== null && row.price !== null && Number(row.sale_price) < Number(row.price),
+    discountPercent: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100)) : null,
+    offerLabel: row.sale_price !== null && row.mrp !== null && Number(row.mrp) > 0 ? `${Math.max(0, Math.round((1 - Number(row.sale_price) / Number(row.mrp)) * 100))}% OFF` : null,
+    imageUrl: row.image_url || null,
+    imageUrls: row.image_url ? [row.image_url] : [],
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
@@ -3790,6 +4191,20 @@ async function refreshSetCount(setId) {
   return count || 0;
 }
 
+function slugify(value, fallback = 'item') {
+  const text = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return text || fallback;
+}
+
+async function generatedTextId(table, base, prefix = 'item') {
+  const safeBase = slugify(base, prefix).slice(0, 60);
+  const candidate = `${prefix}-${safeBase}`.slice(0, 120);
+  const { data, error: lookupError } = await supabaseAdmin.from(table).select('id').eq('id', candidate).maybeSingle();
+  if (lookupError) throw lookupError;
+  if (!data) return candidate;
+  return `${candidate}-${crypto.randomBytes(3).toString('hex')}`.slice(0, 120);
+}
+
 function questionPayload(body = {}) {
   const questionId = bodyValue(body, 'questionId', 'question_id');
   const stem = bodyValue(body, 'stem');
@@ -3850,7 +4265,7 @@ function questionPayload(body = {}) {
   }
 
   return {
-    question_id: requiredText(questionId, 'questionId'),
+    question_id: optionalText(questionId) || `q-${crypto.randomUUID()}`,
     stem: cleanStem,
     question_type: String(questionType),
     difficulty: nullableNumber(difficulty, 1),
@@ -4071,11 +4486,10 @@ app.get('/api/admin/exams', adminAuth, async (req, res) => {
 app.post('/api/admin/exams', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const examId = requiredText(bodyValue(body, 'id'), 'id');
     const name = requiredText(bodyValue(body, 'name'), 'name');
 
     const payload = {
-      id: examId,
+      id: await generatedTextId('exams', name, 'exam'),
       name,
       code: optionalText(bodyValue(body, 'code')),
       short_name: optionalText(bodyValue(body, 'shortName', 'short_name')),
@@ -4086,6 +4500,8 @@ app.post('/api/admin/exams', adminAuth, async (req, res) => {
       total_sets: 0,
       total_questions_available: 0,
       free_sets: 0,
+      icon_url: optionalText(bodyValue(body, 'iconUrl', 'icon_url')),
+      banner_url: optionalText(bodyValue(body, 'bannerUrl', 'banner_url')),
     };
 
     const { data, error: dbError } = await supabaseAdmin
@@ -4115,6 +4531,8 @@ app.patch('/api/admin/exams/:id', adminAuth, async (req, res) => {
       update.short_name = optionalText(bodyValue(body, 'shortName', 'short_name'));
     }
     if (body.description !== undefined) update.description = optionalText(body.description);
+    if (body.iconUrl !== undefined || body.icon_url !== undefined) update.icon_url = optionalText(bodyValue(body, 'iconUrl', 'icon_url'));
+    if (body.bannerUrl !== undefined || body.banner_url !== undefined) update.banner_url = optionalText(bodyValue(body, 'bannerUrl', 'banner_url'));
     if (body.isActive !== undefined || body.is_active !== undefined) {
       update.is_active = Boolean(bodyValue(body, 'isActive', 'is_active'));
     }
@@ -4189,14 +4607,13 @@ app.get('/api/admin/subjects', adminAuth, async (req, res) => {
 app.post('/api/admin/subjects', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const name = requiredText(bodyValue(body, 'name'), 'name');
     const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
 
     await assertExists('exams', 'id', examId, 'Exam');
 
     const payload = {
-      id,
+      id: await generatedTextId('subjects', `${examId}-${name}`, 'subject'),
       name,
       exam_id: examId,
       question_count: 0,
@@ -4332,7 +4749,6 @@ app.get('/api/admin/taxonomy/:id', adminAuth, async (req, res) => {
 app.post('/api/admin/taxonomy', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const name = requiredText(bodyValue(body, 'name'), 'name');
     const nodeType = requiredText(
       bodyValue(body, 'nodeType', 'node_type'),
@@ -4348,7 +4764,7 @@ app.post('/api/admin/taxonomy', adminAuth, async (req, res) => {
     if (examId) await assertExists('exams', 'id', examId, 'Exam');
 
     const payload = {
-      id,
+      id: await generatedTextId('taxonomy_nodes', `${subjectId || examId || 'taxonomy'}-${name}`, 'node'),
       parent_id: parentId,
       subject_id: subjectId,
       exam_id: examId,
@@ -4522,10 +4938,11 @@ app.get('/api/admin/sets/:id', adminAuth, async (req, res) => {
 app.post('/api/admin/sets', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const payload = setPayload(body);
+    const id = await generatedTextId('sets', `${payload.exam_id}-${payload.name}-${payload.year || ''}`, 'set');
 
-    await assertExists('exams', 'id', payload.exam_id, 'Exam');
+    const exam = await assertExists('exams', 'id', payload.exam_id, 'Exam');
+    if (!payload.exam_name) payload.exam_name = exam.name;
     if (payload.subject_id) await assertExists('subjects', 'id', payload.subject_id, 'Subject');
 
     const { data, error: dbError } = await supabaseAdmin
@@ -4574,10 +4991,10 @@ app.patch('/api/admin/sets/:id', adminAuth, async (req, res) => {
     if (body.name !== undefined) update.name = requiredText(body.name, 'name');
     if (body.examId !== undefined || body.exam_id !== undefined) {
       const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
-      await assertExists('exams', 'id', examId, 'Exam');
+      const exam = await assertExists('exams', 'id', examId, 'Exam');
       update.exam_id = examId;
-    }
-    if (body.examName !== undefined || body.exam_name !== undefined) {
+      update.exam_name = exam.name;
+    } else if (body.examName !== undefined || body.exam_name !== undefined) {
       update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
     }
     if (body.subjectId !== undefined || body.subject_id !== undefined) {
@@ -4723,7 +5140,10 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
   try {
     const payload = questionPayload(req.body || {});
 
-    if (payload.exam_id) await assertExists('exams', 'id', payload.exam_id, 'Exam');
+    if (payload.exam_id) {
+      const exam = await assertExists('exams', 'id', payload.exam_id, 'Exam');
+      if (!payload.exam_name) payload.exam_name = exam.name;
+    }
     if (payload.subject_id) await assertExists('subjects', 'id', payload.subject_id, 'Subject');
     if (payload.topic_id) await assertExists('taxonomy_nodes', 'id', payload.topic_id, 'Topic');
 
@@ -4734,6 +5154,19 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
       .single();
 
     if (dbError) throw dbError;
+
+    if (req.body?.sourceSetId) {
+      await assertExists('sets', 'id', String(req.body.sourceSetId), 'Set');
+      const { data: last, error: lastError } = await supabaseAdmin
+        .from('set_questions').select('position').eq('set_id', String(req.body.sourceSetId))
+        .order('position', { ascending: false }).limit(1).maybeSingle();
+      if (lastError) throw lastError;
+      const { error: linkError } = await supabaseAdmin.from('set_questions').upsert({
+        set_id: String(req.body.sourceSetId), question_id: data.id, position: Number(last?.position || 0) + 1,
+      }, { onConflict: 'set_id,question_id' });
+      if (linkError) throw linkError;
+      await refreshSetCount(String(req.body.sourceSetId));
+    }
 
     await refreshSubjectCounts([payload.subject_id]);
     await refreshExamCounts([payload.exam_id]);
@@ -4816,13 +5249,17 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
     if (body.sourceYear !== undefined || body.source_year !== undefined) {
       update.source_year = nullableNumber(bodyValue(body, 'sourceYear', 'source_year'));
     }
-    if (body.examName !== undefined || body.exam_name !== undefined) {
-      update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
-    }
     if (body.examId !== undefined || body.exam_id !== undefined) {
       const examId = optionalText(bodyValue(body, 'examId', 'exam_id'));
-      if (examId) await assertExists('exams', 'id', examId, 'Exam');
+      if (examId) {
+        const exam = await assertExists('exams', 'id', examId, 'Exam');
+        update.exam_name = exam.name;
+      } else {
+        update.exam_name = null;
+      }
       update.exam_id = examId;
+    } else if (body.examName !== undefined || body.exam_name !== undefined) {
+      update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
     }
     if (body.subjectId !== undefined || body.subject_id !== undefined) {
       const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
@@ -5242,8 +5679,8 @@ app.get('/api/admin/banners', adminAuth, async (req, res) => {
 app.post('/api/admin/banners', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const title = requiredText(bodyValue(body, 'title'), 'title');
+    const id = await generatedTextId('banners', title, 'banner');
 
     const { data, error: dbError } = await supabaseAdmin
       .from('banners')
@@ -5344,8 +5781,8 @@ app.get('/api/admin/subscription-plans', adminAuth, async (req, res) => {
 app.post('/api/admin/subscription-plans', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const name = requiredText(bodyValue(body, 'name'), 'name');
+    const id = await generatedTextId('subscription_plans', name, 'plan');
     const price = nullableNumber(bodyValue(body, 'price'), 0);
 
     const { data, error: dbError } = await supabaseAdmin
@@ -5455,8 +5892,8 @@ app.get('/api/admin/market-products', adminAuth, async (req, res) => {
 app.post('/api/admin/market-products', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const title = requiredText(bodyValue(body, 'title'), 'title');
+    const id = await generatedTextId('market_products', title, 'product');
 
     const { data, error: dbError } = await supabaseAdmin
       .from('market_products')
@@ -5571,8 +6008,8 @@ app.get('/api/admin/mode-rules', adminAuth, async (req, res) => {
 app.post('/api/admin/mode-rules', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const id = requiredText(bodyValue(body, 'id'), 'id');
     const mode = requiredText(bodyValue(body, 'mode'), 'mode');
+    const id = await generatedTextId('mode_rules', mode, 'rule');
     const source = String(bodyValue(body, 'source', 'source', 'supabase'));
 
     const minQuestions = positiveInt(
