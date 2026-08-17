@@ -20,6 +20,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ADMIN_KEY =
   process.env.SUPABASE_SECRET_KEY ||
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ADMIN_KEY ||
   '';
 
 if (!SUPABASE_URL || !SUPABASE_ADMIN_KEY) {
@@ -1841,6 +1842,67 @@ app.post('/auth/login', async (req, res) => {
       500,
       e.message,
       'auth_login_error'
+    );
+  }
+});
+
+
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const refreshToken = String(req.body?.refreshToken || '').trim();
+
+    if (!refreshToken) {
+      return error(
+        res,
+        400,
+        'Refresh token is required.',
+        'auth_refresh_missing'
+      );
+    }
+
+    const {
+      data,
+      error: authError,
+    } = await supabaseAdmin.auth.refreshSession({
+      refresh_token: refreshToken,
+    });
+
+    if (
+      authError ||
+      !data?.session ||
+      !data?.user
+    ) {
+      return error(
+        res,
+        401,
+        authError?.message || 'Session refresh failed.',
+        'auth_refresh_failed'
+      );
+    }
+
+    const profile = await getProfile(data.user.id);
+
+    return response(res, {
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        name:
+          profile?.name ||
+          data.user.user_metadata?.name ||
+          null,
+        avatarUrl:
+          profile?.avatar_url || null,
+      },
+      accessToken: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+    });
+  } catch (e) {
+    console.error('Auth refresh error:', e);
+    return error(
+      res,
+      401,
+      e.message || 'Session refresh failed.',
+      'auth_refresh_error'
     );
   }
 });
@@ -3834,6 +3896,52 @@ app.get('/api/admin/form-options', adminAuth, async (req, res) => {
     return response(res, { exams: examsResult.data || [], subjects: subjectsResult.data || [], taxonomy: taxonomyResult.data || [], sets: setsResult.data || [], questions: questionsResult.data || [] });
   } catch (e) {
     return adminFail(res, e, 'admin_form_options_error', 500);
+  }
+});
+
+// =========================================================
+// ADMIN - SYSTEM CHECK
+// =========================================================
+// This endpoint is intentionally authenticated and never returns
+// the actual Supabase key. It is useful on Render to distinguish
+// authentication problems from a missing/non-privileged admin key.
+app.get('/api/admin/system-check', adminAuth, async (req, res) => {
+  try {
+    const dbResult = await supabaseAdmin
+      .from('exams')
+      .select('id')
+      .limit(1);
+
+    if (dbResult.error) throw dbResult.error;
+
+    const storageResult =
+      await supabaseAdmin.storage.listBuckets();
+
+    if (storageResult.error) throw storageResult.error;
+
+    const bucket = (storageResult.data || []).find(
+      (item) => item.name === MEDIA_BUCKET
+    );
+
+    return response(res, {
+      database: {
+        ok: true,
+      },
+      storage: {
+        ok: true,
+        bucket: MEDIA_BUCKET,
+        exists: Boolean(bucket),
+      },
+      adminKey: {
+        configured: true,
+        type: SUPABASE_ADMIN_KEY.startsWith('sb_secret_')
+          ? 'supabase_secret'
+          : 'legacy_service_role',
+      },
+    });
+  } catch (e) {
+    console.error('[ADMIN SYSTEM CHECK ERROR]', e);
+    return adminFail(res, e, 'admin_system_check_error', 503);
   }
 });
 
@@ -6489,7 +6597,7 @@ const server = app.listen(
   HOST,
   () => {
     console.log(
-      `PYQ Pulse Express API running on http://${HOST}:${PORT}`
+      `Updated PYQ Pulse Express API running on http://${HOST}:${PORT}`
     );
 
     console.log(
