@@ -18,14 +18,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 // Prefer the newer secret key when available, otherwise use the legacy
 // service-role key. Never put either key in the admin-panel frontend.
 const SUPABASE_ADMIN_KEY =
-  process.env.SUPABASE_SECRET_KEY ||
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ADMIN_KEY ||
-  '';
+  process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 if (!SUPABASE_URL || !SUPABASE_ADMIN_KEY) {
   throw new Error(
-    'SUPABASE_URL and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) are required.'
+    'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.'
   );
 }
 
