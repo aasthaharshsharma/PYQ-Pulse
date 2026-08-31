@@ -4000,12 +4000,12 @@ function adminDbError(e, fallbackCode) {
     (isRls ? 503 : e?.code === '23505' ? 409 : e?.code === '23503' ? 400 : 400);
 
   return {
-    status,
-    message: isRls
-      ? 'Admin database access is not using a privileged Supabase Secret/service_role key. Set SUPABASE_SECRET_KEY (sb_secret_...) or SUPABASE_SERVICE_ROLE_KEY to the Supabase service_role key on the Express server, then restart it.'
-      : rawMessage,
-    code,
-  };
+  status,
+  message: rawMessage,
+  code,
+  details: e?.details ?? null,
+  hint: e?.hint ?? null,
+};
 }
 
 function adminFail(res, e, fallbackCode, fallbackStatus = 400) {
