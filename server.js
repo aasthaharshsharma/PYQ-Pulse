@@ -18,11 +18,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 // Prefer the newer secret key when available, otherwise use the legacy
 // service-role key. Never put either key in the admin-panel frontend.
 const SUPABASE_ADMIN_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  process.env.SUPABASE_SECRET_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ADMIN_KEY ||
+  '';
 
 if (!SUPABASE_URL || !SUPABASE_ADMIN_KEY) {
   throw new Error(
-    'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.'
+    'SUPABASE_URL and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) are required.'
   );
 }
 
@@ -576,9 +579,40 @@ async function auth(req, res, next) {
 
 async function adminAuth(req, res, next) {
   try {
-    const header = req.headers.authorization || '';
+    // ADMIN ONLY: read the access token from the standard Authorization header.
+    // Some API clients/proxies can strip or rewrite Authorization, so we also
+    // accept X-Access-Token as a safe fallback. Never log the token itself.
+    const authorization = String(
+      req.headers.authorization || req.get('Authorization') || ''
+    ).trim();
 
-    if (!header.startsWith('Bearer ')) {
+    const fallbackToken = String(
+      req.headers['x-access-token'] || ''
+    ).trim();
+
+    let token = '';
+    let source = '';
+
+    const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+    if (match && match[1]) {
+      token = match[1].trim();
+      source = 'Authorization';
+    } else if (fallbackToken) {
+      token = fallbackToken;
+      source = 'X-Access-Token';
+    }
+
+    if (!token) {
+      // Safe diagnostic: only presence/scheme, never the credential.
+      console.warn('[ADMIN AUTH] No usable admin token', {
+        authorizationPresent: Boolean(authorization),
+        authorizationScheme: authorization
+          ? authorization.split(/\s+/)[0]
+          : null,
+        xAccessTokenPresent: Boolean(fallbackToken),
+      });
+
       return error(
         res,
         401,
@@ -587,16 +621,7 @@ async function adminAuth(req, res, next) {
       );
     }
 
-    const token = header.slice(7).trim();
-
-    if (!token) {
-      return error(
-        res,
-        401,
-        'Invalid or expired token.',
-        'auth_invalid'
-      );
-    }
+    console.log(`[ADMIN AUTH] Token received via ${source}`);
 
     const { data, error: authError } =
       await supabaseAdmin.auth.getUser(token);
@@ -649,8 +674,8 @@ async function adminAuth(req, res, next) {
     return error(
       res,
       401,
-      'Invalid admin authentication.',
-      'admin_auth_invalid'
+      'Invalid or expired token.',
+      'auth_invalid'
     );
   }
 }
@@ -4000,12 +4025,12 @@ function adminDbError(e, fallbackCode) {
     (isRls ? 503 : e?.code === '23505' ? 409 : e?.code === '23503' ? 400 : 400);
 
   return {
-  status,
-  message: rawMessage,
-  code,
-  details: e?.details ?? null,
-  hint: e?.hint ?? null,
-};
+    status,
+    message: isRls
+      ? 'Admin database access is not using a privileged Supabase Secret/service_role key. Set SUPABASE_SECRET_KEY (sb_secret_...) or SUPABASE_SERVICE_ROLE_KEY to the Supabase service_role key on the Express server, then restart it.'
+      : rawMessage,
+    code,
+  };
 }
 
 function adminFail(res, e, fallbackCode, fallbackStatus = 400) {
@@ -6588,6 +6613,8 @@ app.use(
 | Server
 |--------------------------------------------------------------------------
 */
+
+console.log('ADMIN AUTH FIX v2: Authorization + X-Access-Token enabled');
 
 const server = app.listen(
   PORT,
